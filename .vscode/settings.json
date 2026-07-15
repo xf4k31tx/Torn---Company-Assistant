@@ -1,0 +1,7 @@
+{
+    "github.copilot.chat.anthropic.tools.websearch.enabled": true,
+    "github.copilot.chat.anthropic.contextEditing.mode": "off",
+    "github.copilot.chat.codesearch.enabled": true,
+    "github.copilot.chat.askAgent.model": "",
+    "github.copilot.chat.exploreAgent.enabled": true
+}

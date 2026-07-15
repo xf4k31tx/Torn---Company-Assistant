@@ -1,0 +1,277 @@
+{
+  "_meta": {
+    "description": "Mock endpoint definitions and sample responses for Torn API, Tornstats API, and Google Sheets API.",
+    "rate_limits": {
+      "torn_per_user_per_minute": 100,
+      "torn_per_ip_per_minute": 1000,
+      "tornstats_unknown": "undocumented"
+    }
+  },
+  "torn_api": {
+    "base_urls": {
+      "v1": "https://api.torn.com",
+      "v2": "https://api.torn.com/v2"
+    },
+    "endpoints": {
+      "get_company": {
+        "method": "GET",
+        "url": "v1/company/{company_id}",
+        "params": {
+          "selections": "detailed,employees,profile,stock,timestamp",
+          "key": "{api_key}",
+          "comment": "{comment}"
+        },
+        "response": {
+          "company": {
+            "name": "Knotty Oil Co",
+            "rating": 9.2,
+            "employees_hired": 12,
+            "employees_capacity": 15,
+            "daily_income": 4250000,
+            "daily_customers": 38,
+            "weekly_income": 29750000,
+            "weekly_customers": 266,
+            "days_old": 842
+          },
+          "company_detailed": {
+            "company_funds": 87500000,
+            "popularity": 88,
+            "efficiency": 92,
+            "environment": 71,
+            "trains_available": 3,
+            "advertising_budget": 350000,
+            "upgrades": {
+              "company_size": 8,
+              "staffroom_size": 5,
+              "storage_size": 4,
+              "storage_space": 750
+            }
+          },
+          "company_employees": {
+            "220001": {
+              "name": "JohnKnot",
+              "position": "Director",
+              "wage": 200000,
+              "days_in_company": 842,
+              "last_action": { "timestamp": 1776099600, "status": "Online" },
+              "effectiveness": { "total": 97, "working_stats": 42, "settled_in": 15, "director_education": 10, "addiction": 5, "inactivity": 10, "management": 5, "book": 5, "merits": 5 }
+            },
+            "220002": {
+              "name": "OilHand42",
+              "position": "Oil Courier",
+              "wage": 85000,
+              "days_in_company": 310,
+              "last_action": { "timestamp": 1776099000, "status": "Online" },
+              "effectiveness": { "total": 78, "working_stats": 35, "settled_in": 10, "director_education": 3, "addiction": 10, "inactivity": 8, "management": 2, "book": 5, "merits": 5 }
+            },
+            "220003": {
+              "name": "TankFillr",
+              "position": "Oil Courier",
+              "wage": 82000,
+              "days_in_company": 180,
+              "last_action": { "timestamp": 1776090000, "status": "Idle" },
+              "effectiveness": { "total": 65, "working_stats": 30, "settled_in": 5, "director_education": 2, "addiction": 15, "inactivity": 5, "management": 3, "book": 0, "merits": 5 }
+            },
+            "220004": {
+              "name": "FinanceGuru",
+              "position": "Accountant",
+              "wage": 110000,
+              "days_in_company": 520,
+              "last_action": { "timestamp": 1776098000, "status": "Online" },
+              "effectiveness": { "total": 91, "working_stats": 38, "settled_in": 12, "director_education": 8, "addiction": 5, "inactivity": 10, "management": 8, "book": 5, "merits": 5 }
+            },
+            "220005": {
+              "name": "TrainerX",
+              "position": "Trainer",
+              "wage": 95000,
+              "days_in_company": 90,
+              "last_action": { "timestamp": 1776085000, "status": "Offline" },
+              "effectiveness": { "total": 52, "working_stats": 22, "settled_in": 3, "director_education": 5, "addiction": 5, "inactivity": 12, "management": 3, "book": 2, "merits": 0 }
+            }
+          },
+          "company_stock": {
+            "Premium Oil": { "in_stock": 250, "on_order": 0, "cost": 450, "price": 1100, "sold_amount": 40, "sold_worth": 44000 },
+            "Standard Oil": { "in_stock": 500, "on_order": 100, "cost": 200, "price": 500, "sold_amount": 120, "sold_worth": 60000 },
+            "Filter Pack": { "in_stock": 75, "on_order": 0, "cost": 80, "price": 250, "sold_amount": 15, "sold_worth": 3750 },
+            "Oil Canister": { "in_stock": 30, "on_order": 50, "cost": 600, "price": 1500, "sold_amount": 5, "sold_worth": 7500 }
+          },
+          "timestamp": 1776100000
+        }
+      },
+      "get_company_listings": {
+        "method": "GET",
+        "url": "v2/company/{company_type_id}/companies",
+        "params": { "limit": "int", "offset": "int", "key": "{api_key}", "comment": "{comment}" },
+        "response": {
+          "companies": {
+            "220001": { "name": "Knotty Oil Co", "type": 12, "rating": 9.2, "position": 1, "owner": { "name": "JohnKnot", "level": 75 } },
+            "220100": { "name": "Quick Lube", "type": 12, "rating": 6.8, "position": 15, "owner": { "name": "FastHands", "level": 42 } },
+            "220200": { "name": "Oil Express", "type": 12, "rating": 7.4, "position": 8, "owner": { "name": "DrainPlug", "level": 58 } }
+          },
+          "_metadata": { "total": 42, "offset": 0, "limit": 100 }
+        }
+      },
+      "get_user_workstats": {
+        "method": "GET",
+        "url": "v1/user/{user_id}",
+        "params": { "selections": "workstats", "key": "{api_key}", "comment": "{comment}" },
+        "response": {
+          "workstats": { "manual_labor": 85000, "intelligence": 62000, "endurance": 98000 },
+          "player_id": 220001,
+          "name": "JohnKnot"
+        }
+      },
+      "get_user_education": {
+        "method": "GET",
+        "url": "v1/user/{user_id}",
+        "params": { "selections": "education", "key": "{api_key}", "comment": "{comment}" },
+        "response": {
+          "education": {
+            "1": { "course": "Business Management", "level": 10, "completed": 1775000000 },
+            "5": { "course": "Accounting", "level": 8, "completed": 1774000000 }
+          },
+          "player_id": 220001,
+          "name": "JohnKnot"
+        }
+      },
+      "check_key_info": {
+        "method": "GET",
+        "url": "v1/key",
+        "params": { "selections": "info", "key": "{api_key}", "comment": "{comment}" },
+        "response": {
+          "key": "FICTIONAL_KEY_AB12",
+          "player_id": 220001,
+          "name": "JohnKnot",
+          "level": 75,
+          "access_type": "Limited",
+          "access_level": 3,
+          "expires": 1900000000
+        }
+      },
+      "errors": {
+        "rate_limited": { "error": { "code": 5, "error": "Too many requests (rate limited, max 100/min)" } },
+        "incorrect_key": { "error": { "code": 2, "error": "Incorrect key" } },
+        "key_disabled": { "error": { "code": 13, "error": "Key temporarily disabled (owner inactive 7+ days)" } },
+        "empty_key": { "error": { "code": 1, "error": "Key is empty" } },
+        "access_level": { "error": { "code": 16, "error": "Access level of this key is not high enough" } },
+        "wrong_type": { "error": { "code": 3, "error": "Wrong type" } },
+        "wrong_fields": { "error": { "code": 4, "error": "Wrong fields" } },
+        "incorrect_id": { "error": { "code": 6, "error": "Incorrect ID" } },
+        "no_permission": { "error": { "code": 7, "error": "Incorrect ID-entity relation (no permission to view this)" } },
+        "ip_block": { "error": { "code": 8, "error": "IP block" } },
+        "api_disabled": { "error": { "code": 9, "error": "API disabled" } },
+        "daily_limit": { "error": { "code": 14, "error": "Daily read limit reached" } }
+      }
+    }
+  },
+  "tornstats_api": {
+    "base_url": "https://www.tornstats.com/api",
+    "version": "v2",
+    "endpoints": {
+      "get_efficiency": {
+        "method": "GET",
+        "url": "v2/{api_key}/efficiency",
+        "params": { "man": "int (optional)", "int": "int (optional)", "end": "int (optional)" },
+        "response": {
+          "status": true,
+          "12": {
+            "company": "Oil Company",
+            "Director": 94.2,
+            "Oil Courier": 68.5,
+            "Accountant": 82.1,
+            "Trainer": 71.3
+          },
+          "5": {
+            "company": "Candle Shop",
+            "Director": 91.0,
+            "Salesperson": 65.2
+          },
+          "7": {
+            "company": "Grocery Store",
+            "Director": 88.4,
+            "Cashier": 70.8,
+            "Stock Clerk": 64.9
+          }
+        }
+      },
+      "get_faction_roster": {
+        "method": "GET",
+        "url": "v2/{api_key}/faction/roster",
+        "response": {
+          "status": true,
+          "members": [
+            { "name": "JohnKnot", "level": 75, "position": "Leader", "days_in_faction": 500 },
+            { "name": "OilHand42", "level": 42, "position": "Member", "days_in_faction": 310 }
+          ]
+        }
+      },
+      "get_faction_skills": {
+        "method": "GET",
+        "url": "v2/{api_key}/faction/skills",
+        "response": {
+          "status": true,
+          "skills": {
+            "armory": 10,
+            "medical": 8,
+            "psychology": 5,
+            "transport": 12
+          }
+        }
+      },
+      "validate_key": {
+        "method": "GET",
+        "url": "v2/{api_key}/",
+        "response": {
+          "status": true,
+          "message": "Key valid"
+        }
+      },
+      "errors": {
+        "invalid_key": { "status": false, "message": "Invalid API key" },
+        "rate_limited": { "status": false, "message": "Rate limited, please wait" }
+      }
+    }
+  },
+  "google_sheets": {
+    "api_name": "Google Sheets API v4",
+    "auth": "OAuth 2.0 (Desktop app flow) via gspread",
+    "tabs": {
+      "Company_History": {
+        "write_style": "append (newest-first, inserted at row 2)",
+        "headers": ["timestamp", "date", "name", "rating", "employees_hired", "employees_capacity", "daily_income", "daily_profit", "daily_customers", "weekly_income", "weekly_profit", "weekly_customers", "days_old", "company_funds", "popularity", "efficiency", "environment", "trains_available", "advertising_budget", "upgrade_company_size", "upgrade_staffroom_size", "upgrade_storage_size", "upgrade_storage_space", "total_wage", "avg_employee_effectiveness", "daily_stockcost", "avg_daily_profit_7day", "avg_daily_income_7day"],
+        "sample_row": ["1776100000", "2026-07-14 12:00 UTC", "Knotty Oil Co", "9.2", "12", "15", "4250000", "3385000.0", "38", "29750000", "18930000.0", "266", "842", "87500000", "88", "92", "71", "3", "350000", "8", "5", "4", "750", "572000", "76.6", "45450.0", "3234000.0", "4100000.0"]
+      },
+      "Stock_History": {
+        "write_style": "append (newest-first, inserted at row 2)",
+        "headers": ["timestamp", "date", "name", "in_stock", "on_order", "cost", "price", "sold_amount", "sold_worth", "delta_in_stock", "delta_sold_amount", "delta_sold_worth", "created"],
+        "sample_rows": [
+          ["1776100000", "2026-07-14 12:00 UTC", "Premium Oil", "250", "0", "450", "1100", "40", "44000", "-10", "40", "44000", "30"],
+          ["1776100000", "2026-07-14 12:00 UTC", "Standard Oil", "500", "100", "200", "500", "120", "60000", "-50", "120", "60000", "70"],
+          ["1776100000", "2026-07-14 12:00 UTC", "Filter Pack", "75", "0", "80", "250", "15", "3750", "-5", "15", "3750", "10"],
+          ["1776100000", "2026-07-14 12:00 UTC", "Oil Canister", "30", "50", "600", "1500", "5", "7500", "0", "5", "7500", "5"]
+        ]
+      },
+      "Employees": {
+        "write_style": "overwrite each snapshot",
+        "headers": ["tId", "name", "position", "wage", "days_in_company", "last_action_ts", "effectiveness_total", "effectiveness_working_stats", "effectiveness_settled_in", "effectiveness_director_education", "effectiveness_addiction", "effectiveness_inactivity", "effectiveness_management", "effectiveness_book", "effectiveness_merits"],
+        "sample_rows": [
+          ["220001", "JohnKnot", "Director", "200000", "842", "1776099600", "97", "42", "15", "10", "5", "10", "5", "5", "5"],
+          ["220002", "OilHand42", "Oil Courier", "85000", "310", "1776099000", "78", "35", "10", "3", "10", "8", "2", "5", "5"],
+          ["220003", "TankFillr", "Oil Courier", "82000", "180", "1776090000", "65", "30", "5", "2", "15", "5", "3", "0", "5"],
+          ["220004", "FinanceGuru", "Accountant", "110000", "520", "1776098000", "91", "38", "12", "8", "5", "10", "8", "5", "5"],
+          ["220005", "TrainerX", "Trainer", "95000", "90", "1776085000", "52", "22", "3", "5", "5", "12", "3", "2", "0"]
+        ]
+      },
+      "Director_Efficiency": {
+        "write_style": "append",
+        "headers": ["timestamp", "date", "position", "efficiency"],
+        "sample_rows": [
+          ["1776100000", "2026-07-14 12:00 UTC", "Director", "94.2"],
+          ["1776100000", "2026-07-14 12:00 UTC", "Oil Courier", "68.5"],
+          ["1776100000", "2026-07-14 12:00 UTC", "Accountant", "82.1"],
+          ["1776100000", "2026-07-14 12:00 UTC", "Trainer", "71.3"]
+        ]
+      }
+    }
+  }
+}
