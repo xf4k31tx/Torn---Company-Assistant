@@ -3,5 +3,10 @@
     "github.copilot.chat.anthropic.contextEditing.mode": "off",
     "github.copilot.chat.codesearch.enabled": true,
     "github.copilot.chat.askAgent.model": "",
-    "github.copilot.chat.exploreAgent.enabled": true
+    "github.copilot.chat.exploreAgent.enabled": true,
+    "python.testing.pytestArgs": [
+        "."
+    ],
+    "python.testing.unittestEnabled": false,
+    "python.testing.pytestEnabled": true
 }
