@@ -30,13 +30,15 @@ class CallRecord:
 # ---------------------------------------------------------------------------
 
 class MockTornAPI:
-    """Drop-in replacement for app.torn_api.TornAPI.
+    """Drop-in replacement for app.torn_api.TornAPI (v2-first, matching the
+    Phase 4 collector rewrite).
 
     Returns canned responses from mock_data/endpoints.json.
     Call ``.calls`` to inspect what the code under test requested.
 
     Use ``inject_error(name)`` on any method to make it raise
-    ``TornAPIError`` with the named error scenario.
+    ``TornAPIError`` with the named error scenario (one-shot: cleared after
+    the next call to that method, whether or not it actually raised).
     """
 
     def __init__(self, api_key: str = "MOCK_KEY"):
@@ -44,10 +46,11 @@ class MockTornAPI:
         self.calls: list[CallRecord] = []
         self._data = _load_mock_data()["torn_api"]["endpoints"]
         self._errors: dict[str, Optional[str]] = {
-            "get_company": None,
+            "get_company_profile_v2": None,
+            "get_company_employees": None,
+            "get_company_stock_v2": None,
+            "get_company_timestamp_v2": None,
             "get_company_listings": None,
-            "get_user_workstats": None,
-            "get_user_education": None,
             "check_key_info": None,
         }
 
@@ -79,27 +82,41 @@ class MockTornAPI:
     def _record(self, method: str, *args, **kwargs) -> None:
         self.calls.append(CallRecord(method=method, args=args, kwargs=kwargs))
 
-    # -- method stubs matching the real TornAPI interface --
+    # -- method stubs matching the real (v2-first) TornAPI interface --
 
-    def get_company(self, company_id: Optional[str] = None) -> dict:
-        self._record("get_company", company_id)
-        self._raise_if_error("get_company")
-        return copy.deepcopy(self._data["get_company"]["response"])
+    def get_company_profile_v2(self) -> dict:
+        self._record("get_company_profile_v2")
+        self._raise_if_error("get_company_profile_v2")
+        return copy.deepcopy(self._data["get_company_profile_v2"]["response"])
+
+    def get_company_employees(self) -> dict:
+        self._record("get_company_employees")
+        self._raise_if_error("get_company_employees")
+        return copy.deepcopy(self._data["get_company_employees"]["response"])
+
+    def get_company_stock_v2(self) -> dict:
+        self._record("get_company_stock_v2")
+        self._raise_if_error("get_company_stock_v2")
+        return copy.deepcopy(self._data["get_company_stock_v2"]["response"])
+
+    def get_company_timestamp_v2(self) -> dict:
+        self._record("get_company_timestamp_v2")
+        self._raise_if_error("get_company_timestamp_v2")
+        return copy.deepcopy(self._data["get_company_timestamp_v2"]["response"])
 
     def get_company_listings(self, company_type_id: int, offset: int = 0, limit: int = 100) -> dict:
         self._record("get_company_listings", company_type_id, offset, limit)
         self._raise_if_error("get_company_listings")
-        return copy.deepcopy(self._data["get_company_listings"]["response"])
-
-    def get_user_workstats(self, user_id: Optional[str] = None) -> dict:
-        self._record("get_user_workstats", user_id)
-        self._raise_if_error("get_user_workstats")
-        return copy.deepcopy(self._data["get_user_workstats"]["response"])
-
-    def get_user_education(self, user_id: Optional[str] = None) -> dict:
-        self._record("get_user_education", user_id)
-        self._raise_if_error("get_user_education")
-        return copy.deepcopy(self._data["get_user_education"]["response"])
+        # Real pagination: only return companies within [offset, offset+limit).
+        # The mock fixture has 3 companies total, so a single page covers it
+        # for the default limit=100 - this still exercises the collector's
+        # pagination loop-termination logic (offset >= total, or empty batch).
+        full = self._data["get_company_listings"]["response"]
+        companies = full["companies"][offset:offset + limit]
+        return {
+            "companies": copy.deepcopy(companies),
+            "_metadata": {**full["_metadata"], "offset": offset, "limit": limit},
+        }
 
     def check_key_info(self) -> dict:
         self._record("check_key_info")
@@ -172,14 +189,19 @@ class MockTornStatsAPI:
 # ---------------------------------------------------------------------------
 
 class MockSheetsClient:
-    """In-memory replacement for app.sheets_client.SheetsClient.
+    """In-memory replacement for app.sheets_client.SheetsClient (Phase 4/5
+    dict-row API, not the older positional-list one).
 
     Data lives in ``self._tabs`` as ``{tab_name: [list_of_dict_rows]}`` so
     tests can inspect what was written and control what ``read_records``
-    returns.  ``.calls`` tracks every operation.
-    """
+    returns. ``.calls`` tracks every operation.
 
-    SHEET_URL = "https://docs.google.com/spreadsheets/d/MOCK_SHEET_ID"
+    Note: real SheetsClient instances are obtained via the
+    ``SheetsClient.get_or_create()`` classmethod, not by constructing one
+    directly - conftest.py's ``patch_sheets`` fixture patches that
+    classmethod to return a fixed instance of this mock rather than trying
+    to make this class stand in for the real one structurally.
+    """
 
     def __init__(self, sheet_id: str = "MOCK_SHEET_ID", sheet_name: str = ""):
         self.sheet_id = sheet_id
@@ -189,7 +211,7 @@ class MockSheetsClient:
 
     @property
     def url(self) -> str:
-        return self.SHEET_URL
+        return f"https://docs.google.com/spreadsheets/d/{self.sheet_id}"
 
     def _record(self, method: str, *args, **kwargs) -> None:
         self.calls.append(CallRecord(method=method, args=args, kwargs=kwargs))
@@ -204,26 +226,24 @@ class MockSheetsClient:
         """Return the current in-memory contents of a tab."""
         return list(self._tabs.get(title, []))
 
-    # -- method stubs matching the real SheetsClient interface --
+    # -- method stubs matching the real (dict-row) SheetsClient interface --
 
-    def append_history_row(self, title: str, headers: list[str], row: list) -> None:
+    def append_history_row(self, title: str, headers: list[str], row: dict) -> None:
         self._record("append_history_row", title, headers, row)
-        if title not in self._tabs:
-            self._tabs[title] = []
-        self._tabs[title].insert(0, dict(zip(headers, [str(v) for v in row])))
+        self._tabs.setdefault(title, [])
+        self._tabs[title].insert(0, {h: str(row.get(h, "")) for h in headers})
 
-    def append_history_rows(self, title: str, headers: list[str], rows: list[list]) -> None:
+    def append_history_rows(self, title: str, headers: list[str], rows: list[dict]) -> None:
         self._record("append_history_rows", title, headers, rows)
-        if title not in self._tabs:
-            self._tabs[title] = []
-        inserted = [dict(zip(headers, [str(v) for v in row])) for row in rows]
+        self._tabs.setdefault(title, [])
+        inserted = [{h: str(row.get(h, "")) for h in headers} for row in rows]
         self._tabs[title] = inserted + self._tabs[title]
 
-    def overwrite_current_state(self, title: str, headers: list[str], rows: list[list]) -> None:
+    def overwrite_current_state(self, title: str, headers: list[str], rows: list[dict]) -> None:
         self._record("overwrite_current_state", title, headers, rows)
-        self._tabs[title] = [dict(zip(headers, [str(v) for v in row])) for row in rows]
+        self._tabs[title] = [{h: str(row.get(h, "")) for h in headers} for row in rows]
 
-    def overwrite_worksheet(self, title: str, headers: list[str], rows: list[list]) -> None:
+    def overwrite_worksheet(self, title: str, headers: list[str], rows: list[dict]) -> None:
         self.overwrite_current_state(title, headers, rows)
 
     def sort_history_newest_first(self, title: str) -> int:

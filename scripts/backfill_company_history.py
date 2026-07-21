@@ -139,8 +139,18 @@ def migrate():
 
     # Rows were processed oldest-first (needed for the rolling averages to
     # cascade correctly); write them back newest-first to match how the app
-    # now orders every history tab.
-    new_rows = [[record.get(col, "") for col in COMPANY_HISTORY_HEADERS] for record in reversed(processed)]
+    # now orders every history tab. overwrite_worksheet() takes {header:
+    # value} dicts (not positional lists) as of Phase 4/5's Sheets client
+    # rework - any old-schema column no longer in COMPANY_HISTORY_HEADERS
+    # (e.g. the removed upgrade_company_size) is intentionally dropped here,
+    # since this script does a full-tab rewrite onto the current canonical
+    # schema. That's different from the live collector's incremental
+    # append path, which never drops an existing column to avoid
+    # misaligning historical rows it isn't touching.
+    new_rows = [
+        {col: record.get(col, "") for col in COMPANY_HISTORY_HEADERS}
+        for record in reversed(processed)
+    ]
 
     sheets.overwrite_worksheet(TAB, COMPANY_HISTORY_HEADERS, new_rows)
     print(f"Recomputed/backfilled {backfilled_count} of {len(processed)} row(s).")

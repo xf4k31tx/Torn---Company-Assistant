@@ -4,10 +4,16 @@ live collector (app/collector.py) and the one-off backfill script
 (scripts/backfill_company_history.py) can't drift out of sync with each
 other.
 
-Torn "week" definition used for avg_daily_profit_7day: Sunday 14:00 UTC ->
-the following Sunday 14:00 UTC. All Torn API timestamps are UTC (TCT), so
+Torn "week" definition used for avg_daily_profit_7day: Sunday 18:00 UTC ->
+the following Sunday 18:00 UTC. All Torn API timestamps are UTC (TCT), so
 this window is computed directly against unix timestamps - no local
 timezone involved anywhere here.
+
+This 18:00 UTC boundary matches the fixed 24-hour period used by the live
+collector's same-period dedup check (app/collector.py's
+_is_same_24h_period) - both are deliberately anchored to the same
+wall-clock cutoff so "which day/week does this snapshot belong to" means
+the same thing everywhere in the app.
 """
 
 from __future__ import annotations
@@ -25,11 +31,11 @@ def safe_float(value) -> float:
 
 
 def torn_week_window(ts: int) -> tuple[int, int]:
-    """(start, end) unix timestamps for the Sun-14:00-UTC -> Sun-14:00-UTC
+    """(start, end) unix timestamps for the Sun-18:00-UTC -> Sun-18:00-UTC
     week that contains ts. end is exclusive."""
-    dt = datetime.datetime.utcfromtimestamp(ts)
+    dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
     days_since_sunday = (dt.weekday() - 6) % 7  # datetime: Mon=0 ... Sun=6
-    candidate = dt.replace(hour=14, minute=0, second=0, microsecond=0) - datetime.timedelta(days=days_since_sunday)
+    candidate = dt.replace(hour=18, minute=0, second=0, microsecond=0) - datetime.timedelta(days=days_since_sunday)
     if candidate > dt:
         candidate -= datetime.timedelta(days=7)
     start = calendar.timegm(candidate.timetuple())
@@ -58,7 +64,7 @@ def compute_rolling_7day_average(prior_rows: Sequence[dict], current_timestamp: 
                                   current_value: float, field_name: str) -> float:
     """
     Average of `field_name` across every snapshot that falls in the same
-    Torn week as current_timestamp (Sun 14:00 UTC -> next Sun 14:00 UTC),
+    Torn week as current_timestamp (Sun 18:00 UTC -> next Sun 18:00 UTC),
     including the current snapshot itself. This is a rolling, in-progress
     average that updates with every snapshot taken during the week - it is
     NOT a fixed "last completed week" figure.

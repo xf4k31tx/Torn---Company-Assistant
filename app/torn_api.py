@@ -1,7 +1,8 @@
 """
 Thin wrapper around the official Torn API (api.torn.com).
 
-Reference (ingested from torn.com/api.html and the YATA source):
+Reference (ingested from torn.com/api.html, the Torn API v2 Swagger docs,
+the YATA source, and live v2/company/* responses):
   - v1: https://api.torn.com/{section}/{id}?selections=a,b,c&key=...
   - v2: https://api.torn.com/v2/{section}/{id}/{selection}?key=...
         (v2 also accepts selections as a query param on some endpoints)
@@ -9,6 +10,22 @@ Reference (ingested from torn.com/api.html and the YATA source):
   - Error code 2 = bad key, 5 = rate limited, 7 = no permission for that
     selection/id relation, 13 = key disabled (owner inactive 7+ days),
     16 = access level too low.
+
+v1 -> v2 migration (Phase 2 of the Employee Calculator merge): v2/company's
+profile/employees/stock/timestamp selections (director's own company, no id
+needed) are a confirmed superset of the old v1 combined call, with some
+field renames - see collector.py and profit_calc.py for where those renamed
+fields get mapped back onto the original Sheet column names. Notably:
+  - v2 top-level key is the selection name itself ("profile"/"stock"/
+    "employees"/"timestamp"), not "company"/"company_detailed"/etc like v1.
+  - v2/company/stock returns a *list*, not a dict keyed by stock name.
+  - advertising_budget (v1) -> advertisement_budget (v2, note the spelling).
+  - v2 upgrades{} has 3 descriptive-string fields (staff_room, storage,
+    storage_capacity); v1's numeric company_size has no v2 equivalent.
+
+Phase 4 (collector rewrite) removed the last caller of the deprecated v1
+get_company() combined selection, so it has been deleted from this module.
+All company data now flows through the v2 methods below.
 """
 
 from __future__ import annotations
@@ -89,32 +106,48 @@ class TornAPI:
             params["selections"] = selections
         return self._get(path, params)
 
-    # ------------------------------------------------------- convenience --
-    def get_company(self, company_id: Optional[str] = None) -> dict:
+    # ---------------------------------------------------- v2 convenience --
+    def get_company_profile_v2(self) -> dict:
         """
-        Full company snapshot: profile, detailed, employees, stock, timestamp.
-        If company_id is None, uses the key owner's own company.
+        v2/company/profile - director's own company. Confirmed live superset
+        of v1's profile+detailed combined: name, created_at, days_old, type
+        {id, name}, rating, director{...}, employees{hired, capacity},
+        income{daily, weekly}, customers{daily, weekly}, funds, popularity,
+        efficiency, environment, trains, advertisement_budget, upgrades
+        {staff_room, storage, storage_capacity}, value. Top-level response
+        key is "profile", not "company".
+        """
+        return self.v2("company", selection="profile")
 
-        Note: this combined selection set is a v1-only call (v2 rejects it
-        with error 22/23 "This selection is only available in API v1" -
-        confirmed against YATA's own implementation, which pulls company
-        data via v1 and reserves v2 for the separate "browse all companies
-        of a type" directory endpoint below).
+    def get_company_employees(self) -> dict:
         """
-        return self.v1("company", company_id, selections="detailed,employees,profile,stock,timestamp")
+        v2/company/employees - director's own company. Returns
+        {"employees": [...]}, each with id, name, position {id, name},
+        days_in_company, status, last_action, stats {manual_labor,
+        intelligence, endurance}, effectiveness {...breakdown..., total},
+        joined_at, wage, value.
+        """
+        return self.v2("company", selection="employees", extra_params={"striptags": "true"})
+
+    def get_company_stock_v2(self) -> dict:
+        """
+        v2/company/stock - director's own company. Returns {"stock": [...]},
+        a *list* (unlike v1's dict keyed by stock name), each item with
+        name, id, cost, rrp, price, in_stock, on_order, sold_amount,
+        sold_worth.
+        """
+        return self.v2("company", selection="stock")
+
+    def get_company_timestamp_v2(self) -> dict:
+        """v2/company/timestamp - director's own company. {"timestamp": int}."""
+        return self.v2("company", selection="timestamp")
 
     def get_company_listings(self, company_type_id: int, offset: int = 0, limit: int = 100) -> dict:
-        """Browse all companies of a given type (public directory)."""
+        """Browse all companies of a given type (public directory) - source
+        for the Company Health Score ranking feature."""
         return self.v2("company", company_type_id, "companies", extra_params={
             "limit": limit, "offset": offset
         })
-
-    def get_user_workstats(self, user_id: Optional[str] = None) -> dict:
-        """Manual labor / intelligence / endurance for the key owner (or given user)."""
-        return self.v1("user", user_id, selections="workstats")
-
-    def get_user_education(self, user_id: Optional[str] = None) -> dict:
-        return self.v1("user", user_id, selections="education")
 
     def check_key_info(self) -> dict:
         return self.v1("key", None, selections="info")

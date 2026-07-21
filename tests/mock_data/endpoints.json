@@ -13,125 +13,104 @@
       "v2": "https://api.torn.com/v2"
     },
     "endpoints": {
-      "get_company": {
+      "get_company_profile_v2": {
         "method": "GET",
-        "url": "v1/company/{company_id}",
-        "params": {
-          "selections": "detailed,employees,profile,stock,timestamp",
-          "key": "{api_key}",
-          "comment": "{comment}"
-        },
+        "url": "v2/company/profile",
+        "params": { "key": "{api_key}", "comment": "{comment}" },
         "response": {
-          "company": {
+          "profile": {
+            "id": 220001,
             "name": "Knotty Oil Co",
             "rating": 9.2,
-            "employees_hired": 12,
-            "employees_capacity": 15,
-            "daily_income": 4250000,
-            "daily_customers": 38,
-            "weekly_income": 29750000,
-            "weekly_customers": 266,
-            "days_old": 842
-          },
-          "company_detailed": {
-            "company_funds": 87500000,
+            "type": { "id": 12, "name": "Oil Rig" },
+            "days_old": 842,
+            "employees": { "hired": 5, "capacity": 15 },
+            "income": { "daily": 4250000, "weekly": 29750000 },
+            "customers": { "daily": 38, "weekly": 266 },
+            "funds": 87500000,
             "popularity": 88,
             "efficiency": 92,
             "environment": 71,
-            "trains_available": 3,
-            "advertising_budget": 350000,
-            "upgrades": {
-              "company_size": 8,
-              "staffroom_size": 5,
-              "storage_size": 4,
-              "storage_space": 750
-            }
-          },
-          "company_employees": {
-            "220001": {
-              "name": "JohnKnot",
-              "position": "Director",
-              "wage": 200000,
-              "days_in_company": 842,
+            "trains": 3,
+            "advertisement_budget": 350000,
+            "upgrades": { "staff_room": "Large staff room", "storage": "Warehouse", "storage_capacity": 750 }
+          }
+        }
+      },
+      "get_company_employees": {
+        "method": "GET",
+        "url": "v2/company/employees",
+        "params": { "striptags": "true", "key": "{api_key}", "comment": "{comment}" },
+        "response": {
+          "employees": [
+            {
+              "id": 220001, "name": "JohnKnot", "position": { "id": 1, "name": "Director" },
+              "days_in_company": 842, "wage": 200000,
               "last_action": { "timestamp": 1776099600, "status": "Online" },
+              "stats": { "manual_labor": 85000, "intelligence": 62000, "endurance": 98000 },
               "effectiveness": { "total": 97, "working_stats": 42, "settled_in": 15, "director_education": 10, "addiction": 5, "inactivity": 10, "management": 5, "book": 5, "merits": 5 }
             },
-            "220002": {
-              "name": "OilHand42",
-              "position": "Oil Courier",
-              "wage": 85000,
-              "days_in_company": 310,
+            {
+              "id": 220002, "name": "OilHand42", "position": { "id": 2, "name": "Oil Courier" },
+              "days_in_company": 310, "wage": 85000,
               "last_action": { "timestamp": 1776099000, "status": "Online" },
+              "stats": { "manual_labor": 40000, "intelligence": 15000, "endurance": 30000 },
               "effectiveness": { "total": 78, "working_stats": 35, "settled_in": 10, "director_education": 3, "addiction": 10, "inactivity": 8, "management": 2, "book": 5, "merits": 5 }
             },
-            "220003": {
-              "name": "TankFillr",
-              "position": "Oil Courier",
-              "wage": 82000,
-              "days_in_company": 180,
+            {
+              "id": 220003, "name": "TankFillr", "position": { "id": 2, "name": "Oil Courier" },
+              "days_in_company": 180, "wage": 82000,
               "last_action": { "timestamp": 1776090000, "status": "Idle" },
+              "stats": { "manual_labor": 25000, "intelligence": 9000, "endurance": 18000 },
               "effectiveness": { "total": 65, "working_stats": 30, "settled_in": 5, "director_education": 2, "addiction": 15, "inactivity": 5, "management": 3, "book": 0, "merits": 5 }
             },
-            "220004": {
-              "name": "FinanceGuru",
-              "position": "Accountant",
-              "wage": 110000,
-              "days_in_company": 520,
+            {
+              "id": 220004, "name": "FinanceGuru", "position": { "id": 3, "name": "Accountant" },
+              "days_in_company": 520, "wage": 110000,
               "last_action": { "timestamp": 1776098000, "status": "Online" },
+              "stats": { "manual_labor": 5000, "intelligence": 70000, "endurance": 12000 },
               "effectiveness": { "total": 91, "working_stats": 38, "settled_in": 12, "director_education": 8, "addiction": 5, "inactivity": 10, "management": 8, "book": 5, "merits": 5 }
             },
-            "220005": {
-              "name": "TrainerX",
-              "position": "Trainer",
-              "wage": 95000,
-              "days_in_company": 90,
+            {
+              "id": 220005, "name": "TrainerX", "position": { "id": 4, "name": "Trainer" },
+              "days_in_company": 90, "wage": 95000,
               "last_action": { "timestamp": 1776085000, "status": "Offline" },
+              "stats": { "manual_labor": 30000, "intelligence": 40000, "endurance": 20000 },
               "effectiveness": { "total": 52, "working_stats": 22, "settled_in": 3, "director_education": 5, "addiction": 5, "inactivity": 12, "management": 3, "book": 2, "merits": 0 }
             }
-          },
-          "company_stock": {
-            "Premium Oil": { "in_stock": 250, "on_order": 0, "cost": 450, "price": 1100, "sold_amount": 40, "sold_worth": 44000 },
-            "Standard Oil": { "in_stock": 500, "on_order": 100, "cost": 200, "price": 500, "sold_amount": 120, "sold_worth": 60000 },
-            "Filter Pack": { "in_stock": 75, "on_order": 0, "cost": 80, "price": 250, "sold_amount": 15, "sold_worth": 3750 },
-            "Oil Canister": { "in_stock": 30, "on_order": 50, "cost": 600, "price": 1500, "sold_amount": 5, "sold_worth": 7500 }
-          },
-          "timestamp": 1776100000
+          ]
         }
+      },
+      "get_company_stock_v2": {
+        "method": "GET",
+        "url": "v2/company/stock",
+        "params": { "key": "{api_key}", "comment": "{comment}" },
+        "response": {
+          "stock": [
+            { "id": 1, "name": "Premium Oil", "in_stock": 250, "on_order": 0, "cost": 450, "price": 1100, "sold_amount": 40, "sold_worth": 44000 },
+            { "id": 2, "name": "Standard Oil", "in_stock": 500, "on_order": 100, "cost": 200, "price": 500, "sold_amount": 120, "sold_worth": 60000 },
+            { "id": 3, "name": "Filter Pack", "in_stock": 75, "on_order": 0, "cost": 80, "price": 250, "sold_amount": 15, "sold_worth": 3750 },
+            { "id": 4, "name": "Oil Canister", "in_stock": 5, "on_order": 50, "cost": 600, "price": 1500, "sold_amount": 5, "sold_worth": 7500 }
+          ]
+        }
+      },
+      "get_company_timestamp_v2": {
+        "method": "GET",
+        "url": "v2/company/timestamp",
+        "params": { "key": "{api_key}", "comment": "{comment}" },
+        "response": { "timestamp": 1776100000 }
       },
       "get_company_listings": {
         "method": "GET",
         "url": "v2/company/{company_type_id}/companies",
         "params": { "limit": "int", "offset": "int", "key": "{api_key}", "comment": "{comment}" },
         "response": {
-          "companies": {
-            "220001": { "name": "Knotty Oil Co", "type": 12, "rating": 9.2, "position": 1, "owner": { "name": "JohnKnot", "level": 75 } },
-            "220100": { "name": "Quick Lube", "type": 12, "rating": 6.8, "position": 15, "owner": { "name": "FastHands", "level": 42 } },
-            "220200": { "name": "Oil Express", "type": 12, "rating": 7.4, "position": 8, "owner": { "name": "DrainPlug", "level": 58 } }
-          },
-          "_metadata": { "total": 42, "offset": 0, "limit": 100 }
-        }
-      },
-      "get_user_workstats": {
-        "method": "GET",
-        "url": "v1/user/{user_id}",
-        "params": { "selections": "workstats", "key": "{api_key}", "comment": "{comment}" },
-        "response": {
-          "workstats": { "manual_labor": 85000, "intelligence": 62000, "endurance": 98000 },
-          "player_id": 220001,
-          "name": "JohnKnot"
-        }
-      },
-      "get_user_education": {
-        "method": "GET",
-        "url": "v1/user/{user_id}",
-        "params": { "selections": "education", "key": "{api_key}", "comment": "{comment}" },
-        "response": {
-          "education": {
-            "1": { "course": "Business Management", "level": 10, "completed": 1775000000 },
-            "5": { "course": "Accounting", "level": 8, "completed": 1774000000 }
-          },
-          "player_id": 220001,
-          "name": "JohnKnot"
+          "companies": [
+            { "id": 220100, "name": "Quick Lube", "rating": 6.8, "income": { "weekly": 40000000 } },
+            { "id": 220001, "name": "Knotty Oil Co", "rating": 9.2, "income": { "weekly": 29750000 } },
+            { "id": 220200, "name": "Oil Express", "rating": 7.4, "income": { "weekly": 15000000 } }
+          ],
+          "_metadata": { "total": 3, "offset": 0, "limit": 100 }
         }
       },
       "check_key_info": {

@@ -10,7 +10,7 @@ from google.oauth2.credentials import Credentials
 
 from . import secure_storage
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive.file"]
 _TOKEN_KEY = "google_oauth_credentials"
 
 

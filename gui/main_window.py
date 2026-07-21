@@ -42,6 +42,7 @@ MONEY_FIELDS = {
         "avg_daily_profit_7day", "avg_daily_income_7day",
     },
     "Employees": {"wage"},
+    "Employee_Effectiveness": {"wage"},
     "Stock_History": {"cost", "price", "sold_worth", "delta_sold_worth"},
 }
 
@@ -49,12 +50,20 @@ MONEY_FIELDS = {
 # rather than a raw epoch number. Keyed by the sheet-tab they come from.
 TIMESTAMP_FIELDS = {
     "Employees": {"last_action_ts"},
+    "Employee_Effectiveness": {"last_action_ts"},
 }
 
 # Fields that are a delta vs. the previous snapshot and should render with an
 # explicit +/- sign so a change is obvious at a glance. Keyed by sheet-tab.
 SIGNED_FIELDS = {
     "Stock_History": {"delta_in_stock", "delta_sold_amount"},
+}
+
+# Fields that are TRUE/FALSE flag columns and should render as a plain-
+# language yes/blank rather than the raw sheet string. Keyed by sheet-tab.
+BOOL_FIELDS = {
+    "Employee_Effectiveness": {"misplaced_flag", "wage_efficiency_flag"},
+    "Stock_History": {"stockout_soon"},
 }
 
 
@@ -77,7 +86,7 @@ def format_timestamp(value) -> str:
         return str(value)
     if ts <= 0:
         return str(value)
-    return datetime.datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M UTC")
+    return datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
 def format_time_since(value) -> str:
@@ -117,6 +126,14 @@ def format_signed_int(value) -> str:
     return f"{amount:,}"
 
 
+def format_bool_flag(value) -> str:
+    """Sheet TRUE/FALSE (or Python True/False) -> a plain-language marker.
+    Blank for False so a scanned column reads as "empty unless flagged"
+    rather than a wall of repeated 'No's."""
+    text = str(value).strip().lower()
+    return "\u26a0 Yes" if text in ("true", "1", "yes") else ""
+
+
 def pretty_label(text: str) -> str:
     """Internal snake_case field/column name -> display label.
     'daily_income' -> 'daily income', 'in_stock_difference' -> 'in stock difference'.
@@ -131,7 +148,255 @@ def format_field(field_name: str, value, tab: str) -> str:
         return format_timestamp(value)
     if field_name in SIGNED_FIELDS.get(tab, ()):
         return format_signed_int(value)
+    if field_name in BOOL_FIELDS.get(tab, ()):
+        return format_bool_flag(value)
     return str(value)
+
+
+# Work-stats-effectiveness color grading for the Position Effectiveness tab.
+# Torn/Tornstats don't publish exact color/threshold values for this anywhere
+# (checked - there's no documented spec, just "red is bad, green is good"
+# from players' own screenshots/descriptions), so this reproduces the same
+# red -> orange -> yellow -> light green -> dark green gradient the old
+# heatmap tab already used (matplotlib's "RdYlGn" colormap) as a set of
+# named, continuously-interpolated stops instead of a matplotlib dependency,
+# so plain tk.Label cells can use it too. 100% = exactly meets a position's
+# stat requirement; below is under-qualified, above is over-qualified.
+_EFFECTIVENESS_COLOR_STOPS = [
+    (0.0, (198, 40, 40)),      # deep red     - badly under-qualified
+    (50.0, (239, 108, 0)),     # orange
+    (70.0, (249, 199, 79)),    # yellow
+    (90.0, (156, 204, 101)),   # light green
+    (110.0, (46, 125, 50)),    # dark green   - meets/exceeds requirement
+]
+
+
+def _effectiveness_color(value) -> str:
+    """Work-stats effectiveness percentage -> "#rrggbb" cell color, per
+    _EFFECTIVENESS_COLOR_STOPS. Values are clamped to the stop range, so
+    anything at/above 110% renders as the same dark green as exactly 110%."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        v = 0.0
+    v = max(0.0, min(v, _EFFECTIVENESS_COLOR_STOPS[-1][0]))
+    for (v0, c0), (v1, c1) in zip(_EFFECTIVENESS_COLOR_STOPS, _EFFECTIVENESS_COLOR_STOPS[1:]):
+        if v0 <= v <= v1:
+            t = (v - v0) / (v1 - v0) if v1 != v0 else 0.0
+            r = round(c0[0] + (c1[0] - c0[0]) * t)
+            g = round(c0[1] + (c1[1] - c0[1]) * t)
+            b = round(c0[2] + (c1[2] - c0[2]) * t)
+            return f"#{r:02x}{g:02x}{b:02x}"
+    r, g, b = _EFFECTIVENESS_COLOR_STOPS[-1][1]
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _readable_text_color(hex_background: str) -> str:
+    """Black or white text, whichever reads better on the given background,
+    by standard perceptual luminance - so cell labels stay legible across
+    the whole red-to-green gradient without hand-tuning per color stop."""
+    hex_background = hex_background.lstrip("#")
+    r, g, b = (int(hex_background[i:i + 2], 16) for i in (0, 2, 4))
+    luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255
+    return "#000000" if luminance > 0.55 else "#ffffff"
+
+
+# Full Employees table column set, in order: (header, row_key). Headers use
+# \n for explicit line breaks - ttk.Treeview headings render multi-line
+# text natively (given the 'clam' theme - see launch()), unlike cell
+# values, which Treeview always clips to one line.
+EMPLOYEE_TABLE_COLUMNS = [
+    ("Name", "name"),
+    ("Position", "current_position"),
+    ("Wage", "wage"),
+    ("Days in\nCompany", "days_in_company"),
+    ("Manual\nLabor", "manual_labor"),
+    ("Intelligence", "intelligence"),
+    ("Endurance", "endurance"),
+    ("Total Eff.", "effectiveness_total"),
+    ("Working Stats\nEff.", "effectiveness_working_stats"),
+    ("Settled In\nEff.", "effectiveness_settled_in"),
+    ("Education\nEff.", "effectiveness_director_education"),
+    ("Addiction\nEff.", "effectiveness_addiction"),
+    ("Inactivity\nEff.", "effectiveness_inactivity"),
+    ("Management\nEff.", "effectiveness_management"),
+    ("Book Eff.", "effectiveness_book"),
+    ("Merits Eff.", "effectiveness_merits"),
+    ("Current Pos.\nProjected Eff.", "projected_efficiency_current_position"),
+    ("Best Fit\nPosition", "best_fit_position"),
+    ("Best Fit\nEff.", "best_fit_efficiency"),
+    ("Assigned\nPosition", "assigned_position"),
+    ("Assigned\nEff.", "assigned_efficiency"),
+    ("Misplaced", "misplaced_flag"),
+    ("Wage\nEfficiency", "wage_efficiency"),
+    ("Wage Eff.\nOutlier", "wage_efficiency_flag"),
+    ("Last Action", "last_action_ts"),
+    ("tId", "tId"),
+]
+
+# Shown by default; the rest are available via the "Columns..." toggle.
+# Chosen to mirror the old standalone Employee Calculator's default view
+# plus the new Phase 4 misplaced/wage-outlier flags, without overwhelming
+# a first-time user with all 26 columns at once.
+DEFAULT_VISIBLE_EMPLOYEE_COLUMNS = {
+    "name", "current_position", "wage", "effectiveness_total",
+    "projected_efficiency_current_position", "best_fit_position", "best_fit_efficiency",
+    "assigned_position", "assigned_efficiency", "misplaced_flag", "wage_efficiency_flag",
+}
+
+LEFT_ALIGNED_EMPLOYEE_COLUMNS = {"name", "current_position", "best_fit_position", "assigned_position"}
+
+
+class ColumnPickerDialog(tk.Toplevel):
+    """Modal checklist for which Employees columns are visible. self.result
+    ends up as the list of selected row-keys (in EMPLOYEE_TABLE_COLUMNS
+    order), or None if cancelled."""
+
+    def __init__(self, master, visible_keys):
+        super().__init__(master)
+        self.title("Choose Columns")
+        self.resizable(False, False)
+        self.result = None
+        self.transient(master)
+        self.grab_set()
+
+        self.vars = {key: tk.BooleanVar(value=key in visible_keys) for _, key in EMPLOYEE_TABLE_COLUMNS}
+
+        canvas_frame = ttk.Frame(self)
+        canvas_frame.pack(fill="both", expand=True, padx=12, pady=12)
+        cols = 2
+        for i, (header, key) in enumerate(EMPLOYEE_TABLE_COLUMNS):
+            label = header.replace("\n", " ")
+            ttk.Checkbutton(canvas_frame, text=label, variable=self.vars[key]).grid(
+                row=i // cols, column=i % cols, sticky="w", padx=6, pady=2
+            )
+
+        btn_row = ttk.Frame(self)
+        btn_row.pack(pady=(0, 12))
+        ttk.Button(btn_row, text="Show All", command=self._show_all).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="Apply", command=self._apply).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="Cancel", command=self.destroy).pack(side="left", padx=4)
+
+    def _show_all(self):
+        for var in self.vars.values():
+            var.set(True)
+
+    def _apply(self):
+        self.result = [key for _, key in EMPLOYEE_TABLE_COLUMNS if self.vars[key].get()]
+        self.destroy()
+
+
+class PositionCapacitiesDialog(tk.Toplevel):
+    """
+    Modal dialog configuring how "Assigned Position" fills seats for one
+    company: each position's max headcount, and the priority order
+    positions are filled in. Positions are listed top-to-bottom in current
+    priority order (top = filled first, with the best remaining candidates,
+    before moving down the list); use the up/down buttons to reorder.
+    Leaving a Max Qty field blank means "no cap" for that position.
+
+    self.result ends up as:
+      - {"capacities": {position_name: int}, "priority_order": [position_name, ...]}
+        - user saved settings, run priority-constrained
+      - "global" - user chose to skip capacities/priority entirely
+      - None     - user cancelled
+    """
+
+    def __init__(self, master, position_names, existing_capacities, existing_priority_order=None):
+        super().__init__(master)
+        self.title("Position Capacities && Priority")
+        self.resizable(False, False)
+        self.result = None
+        self.transient(master)
+        self.grab_set()
+
+        existing_priority_order = existing_priority_order or []
+        self.position_order = [p for p in existing_priority_order if p in position_names]
+        self.position_order += [p for p in position_names if p not in self.position_order]
+
+        self.capacity_vars = {
+            pos: tk.StringVar(value=str(existing_capacities[pos]) if existing_capacities.get(pos, "") != "" else "")
+            for pos in position_names
+        }
+
+        ttk.Label(
+            self,
+            text=(
+                "Set each position's max headcount and fill priority (top = filled\n"
+                "first, with the best remaining candidates). Leave Max Qty blank for\n"
+                "no cap on that position."
+            ),
+            justify="left",
+        ).grid(row=0, column=0, sticky="w", padx=12, pady=(12, 8))
+
+        self.rows_frame = ttk.Frame(self)
+        self.rows_frame.grid(row=1, column=0, sticky="w", padx=12)
+        self._render_rows()
+
+        button_row = ttk.Frame(self)
+        button_row.grid(row=2, column=0, pady=12)
+        ttk.Button(button_row, text="Save && Use Priorities", command=self._save_and_run).pack(side="left", padx=4)
+        ttk.Button(button_row, text="Use Global Projection Only", command=self._run_global).pack(side="left", padx=4)
+        ttk.Button(button_row, text="Cancel", command=self._cancel).pack(side="left", padx=4)
+
+    def _render_rows(self):
+        for widget in self.rows_frame.winfo_children():
+            widget.destroy()
+
+        header = ttk.Frame(self.rows_frame)
+        header.grid(row=0, column=0, sticky="w", pady=(0, 4))
+        ttk.Label(header, text="", width=5).grid(row=0, column=0)
+        ttk.Label(header, text="Priority", width=8).grid(row=0, column=1)
+        ttk.Label(header, text="Position", width=22).grid(row=0, column=2)
+        ttk.Label(header, text="Max Qty", width=8).grid(row=0, column=3)
+
+        last = len(self.position_order) - 1
+        for i, pos in enumerate(self.position_order):
+            row = ttk.Frame(self.rows_frame)
+            row.grid(row=i + 1, column=0, sticky="w", pady=1)
+
+            move_frame = ttk.Frame(row, width=50)
+            move_frame.grid(row=0, column=0)
+            up = ttk.Button(move_frame, text="\u25b2", width=2, command=lambda idx=i: self._move(idx, -1))
+            up.grid(row=0, column=0)
+            up.state(["disabled"] if i == 0 else ["!disabled"])
+            down = ttk.Button(move_frame, text="\u25bc", width=2, command=lambda idx=i: self._move(idx, 1))
+            down.grid(row=0, column=1)
+            down.state(["disabled"] if i == last else ["!disabled"])
+
+            ttk.Label(row, text=str(i + 1), width=8, anchor="w").grid(row=0, column=1)
+            ttk.Label(row, text=pos, width=22, anchor="w").grid(row=0, column=2)
+            ttk.Entry(row, textvariable=self.capacity_vars[pos], width=8).grid(row=0, column=3)
+
+    def _move(self, idx, delta):
+        target = idx + delta
+        if 0 <= target < len(self.position_order):
+            self.position_order[idx], self.position_order[target] = (
+                self.position_order[target], self.position_order[idx],
+            )
+            self._render_rows()
+
+    def _save_and_run(self):
+        capacities = {}
+        for pos, var in self.capacity_vars.items():
+            text = var.get().strip()
+            if not text:
+                continue
+            try:
+                capacities[pos] = int(text)
+            except ValueError:
+                messagebox.showerror("Position Capacities", f"'{text}' isn't a whole number for {pos}.")
+                return
+        self.result = {"capacities": capacities, "priority_order": list(self.position_order)}
+        self.destroy()
+
+    def _run_global(self):
+        self.result = "global"
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
 
 
 class MainWindow(tk.Tk):
@@ -216,6 +481,44 @@ class MainWindow(tk.Tk):
         vsb.grid(row=0, column=1, sticky="ns")
         hsb.grid(row=1, column=0, sticky="ew")
         return frame, tree
+    
+    def _make_scrollable_grid(self, parent):
+        """Canvas + inner Frame with both scrollbars, for a spreadsheet-style
+        grid of arbitrary widgets. A plain ttk.Treeview can't do this - it only
+        supports whole-row tag colors, not independent per-cell backgrounds,
+        which the Position Effectiveness tab needs. Returns (frame, canvas,
+        inner) - pack/grid the frame, then .grid() widgets into inner."""
+        frame = ttk.Frame(parent)
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        canvas = tk.Canvas(frame, highlightthickness=0, background="#ffffff")
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
+        hsb = ttk.Scrollbar(frame, orient="horizontal", command=canvas.xview)
+        canvas.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+
+        inner = tk.Frame(canvas, background="#ffffff")
+        window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _on_inner_configure(event):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        inner.bind("<Configure>", _on_inner_configure)
+
+        def _on_canvas_configure(event):
+            canvas.itemconfig(window_id, width=max(event.width, inner.winfo_reqwidth()))
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        # Mouse wheel only scrolls this grid while the cursor is actually over
+        # it, via bind_all/unbind_all on enter/leave - a global permanent bind
+        # would hijack scrolling on every other tab's Treeview too.
+        def _on_mousewheel(event):
+            canvas.yview_scroll(-1 * (event.delta // 120), "units")
+        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+
+        return frame, canvas, inner
 
     def _autosize_columns(self, tree, min_width=60, max_width=420, padding=24):
         """Fits each column's width to its widest visible content (header or
@@ -254,18 +557,21 @@ class MainWindow(tk.Tk):
 
         self.overview_tab = ttk.Frame(self.notebook)
         self.employees_tab = ttk.Frame(self.notebook)
+        self.position_heatmap_tab = ttk.Frame(self.notebook)
         self.stock_tab = ttk.Frame(self.notebook)
         self.trends_tab = ttk.Frame(self.notebook)
         self.settings_tab = ttk.Frame(self.notebook)
 
         self.notebook.add(self.overview_tab, text="Overview")
         self.notebook.add(self.employees_tab, text="Employees")
+        self.notebook.add(self.position_heatmap_tab, text="Position Heatmap")
         self.notebook.add(self.stock_tab, text="Stock & Profit")
         self.notebook.add(self.trends_tab, text="Trends")
         self.notebook.add(self.settings_tab, text="Settings")
 
         self._build_overview_tab()
         self._build_employees_tab()
+        self._build_position_heatmap_tab()
         self._build_stock_tab()
         self._build_trends_tab()
         self._build_settings_tab()
@@ -279,6 +585,8 @@ class MainWindow(tk.Tk):
         top.pack(fill="x", padx=10, pady=10)
 
         ttk.Button(top, text="Run Snapshot Now", command=self.run_snapshot).pack(side="left")
+        ttk.Button(top, text="Run Employee Efficiency Now", command=self.run_employee_efficiency).pack(side="left", padx=6)
+        ttk.Button(top, text="Run Everything", command=self.run_everything).pack(side="left")
         ttk.Button(top, text="Refresh From Sheet", command=self.refresh_from_sheet).pack(side="left", padx=6)
 
         # Company selector: pick which configured company to view.
@@ -320,9 +628,10 @@ class MainWindow(tk.Tk):
             return
         latest = max(records, key=lambda r: int(r.get("timestamp") or 0))
         capacity = latest.get("employees_capacity", "")
+        rank_keys = {"rank_by_income", "rank_total_in_type", "rank_percentile", "rank_trend"}
         for key, value in latest.items():
-            if key == "employees_capacity":
-                continue  # merged into the employees_hired row below
+            if key == "employees_capacity" or key in rank_keys:
+                continue  # employees_capacity merges below; rank_* merges into one Health Score row
             if key == "employees_hired":
                 self.overview_tree.insert(
                     "", "end", text="employees",
@@ -330,6 +639,18 @@ class MainWindow(tk.Tk):
                 )
                 continue
             self.overview_tree.insert("", "end", text=pretty_label(key), values=(format_field(key, value, "Company_History"),))
+
+        rank, total, percentile, trend = (
+            latest.get("rank_by_income"), latest.get("rank_total_in_type"),
+            latest.get("rank_percentile"), latest.get("rank_trend"),
+        )
+        if rank not in (None, ""):
+            arrow = {"up": " \u25b2", "down": " \u25bc", "same": " \u2192"}.get(str(trend).strip().lower(), "")
+            percentile_text = f", top {100 - float(percentile):.0f}%" if percentile not in (None, "") else ""
+            self.overview_tree.insert(
+                "", "end", text="health score (rank by income)",
+                values=(f"#{rank} of {total}{percentile_text}{arrow}",),
+            )
         self._center_overview_columns()
 
     # -------------------------------------------------------- employees --
@@ -337,65 +658,240 @@ class MainWindow(tk.Tk):
         top = ttk.Frame(self.employees_tab)
         top.pack(fill="x", padx=10, pady=10)
         ttk.Button(top, text="Refresh", command=self.refresh_from_sheet).pack(side="left")
+        ttk.Button(top, text="Columns...", command=self._choose_employee_columns).pack(side="left", padx=(6, 0))
+        ttk.Button(top, text="Configure Positions...", command=self._configure_positions).pack(side="left", padx=(6, 0))
 
-        columns = [
-            "tId", "name", "position", "wage", "effectiveness_total",
-            "effectiveness_working_stats", "effectiveness_merits",
-            "effectiveness_addiction", "effectiveness_inactivity",
-            "last_action_ts", "time_since_last_action",
-        ]
-        column_labels = {
-            "effectiveness_working_stats": "E. WST",
-            "effectiveness_merits": "E. MER",
-            "effectiveness_addiction": "E. Add",
-            "effectiveness_inactivity": "E. Inactivity",
-            "time_since_last_action": "Time Since Last Action",
-        }
-        frame, self.employees_tree = self._make_scrollable_tree(
-            self.employees_tab, columns=columns, show="headings", height=25
+        ttk.Label(top, text="Filter:").pack(side="left", padx=(16, 4))
+        self.employee_filter_var = tk.StringVar(value="")
+        filter_entry = ttk.Entry(top, textvariable=self.employee_filter_var, width=20)
+        filter_entry.pack(side="left")
+        filter_entry.bind("<KeyRelease>", lambda e: self._apply_employee_filter())
+
+        legend = ttk.Label(
+            self.employees_tab,
+            text="\u26a0 Misplaced = current-position efficiency trails best-fit by "
+                 "\u226515 pts.  \u26a0 Wage Eff. Outlier = paid 50%+ worse than the roster average per effectiveness point.",
+            foreground="#555555",
         )
-        for col in columns:
+        legend.pack(fill="x", padx=10)
+
+        self.employee_visible_columns = [
+            key for _, key in EMPLOYEE_TABLE_COLUMNS if key in DEFAULT_VISIBLE_EMPLOYEE_COLUMNS
+        ]
+        columns = [key for _, key in EMPLOYEE_TABLE_COLUMNS]
+        frame, self.employees_tree = self._make_scrollable_tree(
+            self.employees_tab, columns=columns, show="headings", height=22
+        )
+        self.employees_tree.tag_configure("misplaced", background="#fff3cd")
+        self.employees_tree.tag_configure("wage_outlier", background="#f8d7da")
+        for header, key in EMPLOYEE_TABLE_COLUMNS:
             self.employees_tree.heading(
-                col, text=pretty_label(column_labels.get(col, col)),
-                command=lambda c=col: self._sort_employees(c, False),
+                key, text=header,
+                command=lambda k=key: self._sort_employees(k, False),
             )
-            self.employees_tree.column(col, width=140, anchor="center")
+            anchor = "w" if key in LEFT_ALIGNED_EMPLOYEE_COLUMNS else "center"
+            self.employees_tree.column(key, width=110, anchor=anchor)
+        self.employees_tree["displaycolumns"] = self.employee_visible_columns
         frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         self._employee_records_cache = []
+        self._employee_sort_column = None
+        self._employee_sort_reverse = False
 
     def _employee_row_values(self, row, columns):
         values = []
         for c in columns:
-            if c == "time_since_last_action":
-                values.append(format_time_since(row.get("last_action_ts", "")))
-            else:
-                values.append(format_field(c, row.get(c, ""), "Employees"))
+            values.append(format_field(c, row.get(c, ""), "Employee_Effectiveness"))
         return values
 
+    def _employee_row_tags(self, row):
+        tags = []
+        if str(row.get("misplaced_flag", "")).strip().lower() in ("true", "1", "yes"):
+            tags.append("misplaced")
+        if str(row.get("wage_efficiency_flag", "")).strip().lower() in ("true", "1", "yes"):
+            tags.append("wage_outlier")
+        return tuple(tags)
+
     def _populate_employees(self):
-        self.employees_tree.delete(*self.employees_tree.get_children())
-        records = self._safe_read("Employees")
+        records = self._safe_read("Employee_Effectiveness")
+        if not records:
+            # Fall back to the plain Employees tab (always written by
+            # run_snapshot()) so there's still something to look at for a
+            # company that hasn't had an Employee Efficiency run yet.
+            records = self._safe_read("Employees")
         self._employee_records_cache = records
-        columns = self.employees_tree["columns"]
+        self._apply_employee_filter()
+
+    def _apply_employee_filter(self):
+        query = (self.employee_filter_var.get() if hasattr(self, "employee_filter_var") else "").strip().lower()
+        records = self._employee_records_cache
+        if query:
+            records = [r for r in records if query in str(r.get("name", "")).lower()]
+        self._render_employee_rows(records)
+
+    def _render_employee_rows(self, records):
+        self.employees_tree.delete(*self.employees_tree.get_children())
+        columns = [key for _, key in EMPLOYEE_TABLE_COLUMNS]
         for row in records:
-            self.employees_tree.insert("", "end", values=self._employee_row_values(row, columns))
+            self.employees_tree.insert(
+                "", "end",
+                values=self._employee_row_values(row, columns),
+                tags=self._employee_row_tags(row),
+            )
         self._autosize_columns(self.employees_tree)
 
     def _sort_employees(self, col, reverse):
-        # time_since_last_action isn't a real stored field - it's derived
-        # from last_action_ts, so sort by that instead (more recent action =
-        # less time elapsed, so this still orders intuitively).
+        reverse = not self._employee_sort_reverse if col == self._employee_sort_column else reverse
         sort_key_field = "last_action_ts" if col == "time_since_last_action" else col
+        query = (self.employee_filter_var.get() if hasattr(self, "employee_filter_var") else "").strip().lower()
+        records = self._employee_records_cache
+        if query:
+            records = [r for r in records if query in str(r.get("name", "")).lower()]
         try:
-            data = sorted(self._employee_records_cache, key=lambda r: float(r.get(sort_key_field, 0) or 0), reverse=reverse)
+            data = sorted(records, key=lambda r: float(r.get(sort_key_field, 0) or 0), reverse=reverse)
         except (TypeError, ValueError):
-            data = sorted(self._employee_records_cache, key=lambda r: str(r.get(sort_key_field, "")), reverse=reverse)
-        self.employees_tree.delete(*self.employees_tree.get_children())
-        columns = self.employees_tree["columns"]
-        for row in data:
-            self.employees_tree.insert("", "end", values=self._employee_row_values(row, columns))
-        self._autosize_columns(self.employees_tree)
-        self.employees_tree.heading(col, command=lambda: self._sort_employees(col, not reverse))
+            data = sorted(records, key=lambda r: str(r.get(sort_key_field, "")), reverse=reverse)
+        self._render_employee_rows(data)
+        self._employee_sort_column = col
+        self._employee_sort_reverse = reverse
+        for header, key in EMPLOYEE_TABLE_COLUMNS:
+            arrow = (" \u25bc" if reverse else " \u25b2") if key == col else ""
+            self.employees_tree.heading(key, text=header + arrow)
+
+    def _choose_employee_columns(self):
+        dialog = ColumnPickerDialog(self, self.employee_visible_columns)
+        self.wait_window(dialog)
+        if dialog.result is not None:
+            self.employee_visible_columns = dialog.result
+            self.employees_tree["displaycolumns"] = self.employee_visible_columns or ["name"]
+            self._autosize_columns(self.employees_tree)
+
+    def _configure_positions(self):
+        company = self._active_company()
+        if not company:
+            messagebox.showinfo("No company selected", "Select or add a company first.")
+            return
+        positions = company.get("last_known_positions") or []
+        if not positions:
+            # Fall back to whatever positions are visible in the currently
+            # loaded roster, in case a Snapshot has run but Employee
+            # Efficiency hasn't (which is what populates last_known_positions).
+            positions = sorted({r.get("current_position") or r.get("position") for r in self._employee_records_cache} - {None, ""})
+        if not positions:
+            messagebox.showinfo(
+                "Configure Positions",
+                "No positions detected yet for this company - run a Snapshot or "
+                "Employee Efficiency pass first so positions can be read from the roster.",
+            )
+            return
+        dialog = PositionCapacitiesDialog(
+            self, positions, company.get("position_capacities") or {}, company.get("position_priority_order") or []
+        )
+        self.wait_window(dialog)
+        if dialog.result and dialog.result != "global":
+            capacities = dict(company.get("position_capacities") or {})
+            capacities.update(dialog.result["capacities"])
+            company["position_capacities"] = capacities
+            company["position_priority_order"] = dialog.result["priority_order"]
+            company["last_known_positions"] = positions
+            try:
+                companies_mod.save_companies(self.companies)
+                messagebox.showinfo("Position Capacities", "Saved.")
+            except Exception:
+                messagebox.showerror("Save failed", "Could not save companies to companies.json")
+
+    # ------------------------------------------------- position heatmap --
+    def _build_position_heatmap_tab(self):
+        top = ttk.Frame(self.position_heatmap_tab)
+        top.pack(fill="x", padx=10, pady=10)
+        ttk.Button(top, text="Refresh", command=self.refresh_from_sheet).pack(side="left")
+        ttk.Label(
+            top,
+            text="Tornstats-projected work-stats effectiveness for every employee at every position "
+                 "this company offers. Read straight from Position_Efficiency (Run Employee Efficiency "
+                 "Now to update). Each employee's current position is boxed.",
+            foreground="#555555",
+            wraplength=560, justify="left",
+        ).pack(side="left", padx=10)
+
+        legend = ttk.Frame(self.position_heatmap_tab)
+        legend.pack(fill="x", padx=10)
+        ttk.Label(legend, text="Effectiveness:", foreground="#555555").pack(side="left")
+        for label, sample_value in (("<50%", 25), ("50-69%", 60), ("70-89%", 80), ("90-109%", 100), ("110%+", 120)):
+            color = _effectiveness_color(sample_value)
+            tk.Label(
+                legend, text=label, background=color, foreground=_readable_text_color(color),
+                width=8, relief="solid", borderwidth=1,
+            ).pack(side="left", padx=(6, 0))
+
+        grid_frame, self.heatmap_canvas, self.heatmap_grid = self._make_scrollable_grid(self.position_heatmap_tab)
+        grid_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+    def _populate_position_efficiency(self):
+        for widget in self.heatmap_grid.winfo_children():
+            widget.destroy()
+
+        records = self._safe_read("Position_Efficiency")
+        if not records:
+            tk.Label(
+                self.heatmap_grid, text="No data yet - run Employee Efficiency first.",
+                background="#ffffff", padx=10, pady=10,
+            ).grid(row=0, column=0, sticky="w")
+            return
+
+        meta_cols = {"tId", "name", "current_position"}
+        position_names = [k for k in records[0].keys() if k not in meta_cols]
+        rows = sorted(records, key=lambda r: str(r.get("name", "")).lower())
+
+        def cell_value(row, pos):
+            try:
+                return float(row.get(pos) or 0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        headers = ["Name", "Current Position", "Current Eff."] + position_names
+        for col, header in enumerate(headers):
+            tk.Label(
+                self.heatmap_grid, text=header, font=("TkDefaultFont", 9, "bold"),
+                background="#e0e0e0", padx=8, pady=4, relief="ridge", borderwidth=1,
+                wraplength=100, justify="center",
+            ).grid(row=0, column=col, sticky="nsew")
+
+        for i, r in enumerate(rows, start=1):
+            name = r.get("name", "")
+            current = r.get("current_position") or ""
+
+            tk.Label(
+                self.heatmap_grid, text=name, anchor="w", padx=8, pady=3,
+                background="#ffffff", relief="ridge", borderwidth=1,
+            ).grid(row=i, column=0, sticky="nsew")
+            tk.Label(
+                self.heatmap_grid, text=current, anchor="w", padx=8, pady=3,
+                background="#ffffff", relief="ridge", borderwidth=1,
+            ).grid(row=i, column=1, sticky="nsew")
+
+            current_value = cell_value(r, current) if current in position_names else 0.0
+            current_color = _effectiveness_color(current_value)
+            tk.Label(
+                self.heatmap_grid, text=f"{current_value:.0f}%", anchor="center", padx=8, pady=3,
+                background=current_color, foreground=_readable_text_color(current_color),
+                font=("TkDefaultFont", 9, "bold"), relief="ridge", borderwidth=1,
+            ).grid(row=i, column=2, sticky="nsew")
+
+            for j, pos in enumerate(position_names, start=3):
+                value = cell_value(r, pos)
+                color = _effectiveness_color(value)
+                is_current = pos == current
+                # Boxed (thicker, solid-relief) cell marks the employee's
+                # current position, replacing the old chart's outlined
+                # rectangle - same "you are here" purpose, plain-grid form.
+                tk.Label(
+                    self.heatmap_grid, text=f"{value:.0f}%", anchor="center", padx=8, pady=3,
+                    background=color, foreground=_readable_text_color(color),
+                    relief="solid" if is_current else "ridge",
+                    borderwidth=3 if is_current else 1,
+                ).grid(row=i, column=j, sticky="nsew")
+
+
 
     # ------------------------------------------------------------ stock --
     def _build_stock_tab(self):
@@ -567,7 +1063,8 @@ class MainWindow(tk.Tk):
         row += 1
         ttk.Label(
             frame,
-            text="Companies - each needs its own Torn API key and its own Google Sheet ID.\n"
+            text="Companies - each needs its own Torn API key (Google Sheet ID is optional; "
+                 "leave it blank to auto-create one named after the company).\n"
                  "Every company here gets snapshotted when you click \"Run Snapshot Now\".",
             justify="left",
         ).grid(row=row, column=0, columnspan=2, sticky="w")
@@ -685,7 +1182,12 @@ class MainWindow(tk.Tk):
         self._save_settings()
         sheet_id, sheet_name = self._active_company_sheet_override()
         if not sheet_id:
-            messagebox.showinfo("Nothing to test", "Add a company with a Google Sheet ID first.")
+            messagebox.showinfo(
+                "No Sheet ID yet",
+                "This company has no Google Sheet ID configured - one will be auto-created "
+                "(named after the company) the first time you run a Snapshot or Employee "
+                "Efficiency pass for it. Nothing to test until then.",
+            )
             return
         try:
             sheets = SheetsClient(sheet_id=sheet_id, sheet_name=sheet_name)
@@ -722,15 +1224,25 @@ class MainWindow(tk.Tk):
         if not self.companies:
             messagebox.showinfo(
                 "No companies configured",
-                "Add at least one company (Torn API key + Google Sheet ID) in Settings first.",
+                "Add at least one company (Torn API key required, Google Sheet ID optional) in Settings first.",
             )
             return
 
         self.set_status("Running snapshot...")
 
         def worker():
-            from app.collector import run_company_snapshots
+            from app.collector import run_company_snapshots, persist_companies
             results = run_company_snapshots(self.companies, base_settings=self.settings)
+            # self.companies always comes from companies_mod.load_companies()
+            # at startup (or the one-time legacy migration, which already
+            # saves itself), so it's always safe to persist here - any
+            # auto-created Sheet ID or updated Health Score rank needs to be
+            # written back now, or it's silently lost (worse: a blank Sheet
+            # ID would auto-create a brand-new Sheet again on every run).
+            try:
+                persist_companies(self.companies)
+            except Exception:
+                pass  # non-fatal - snapshot results still get shown either way
 
             def finish():
                 messages = []
@@ -761,6 +1273,88 @@ class MainWindow(tk.Tk):
             self.set_status(f"Snapshot failed: {result.message}")
             messagebox.showerror("Snapshot failed", result.message)
 
+    def run_employee_efficiency(self):
+        """Run an Employee Efficiency pass for every company configured in
+        Settings > Companies. Needs each company to have both a Torn API
+        key and a Tornstats API key - companies missing the latter report
+        back a failure message rather than being silently skipped."""
+        if not self.companies:
+            messagebox.showinfo(
+                "No companies configured",
+                "Add at least one company (Torn API key required, Google Sheet ID optional) in Settings first.",
+            )
+            return
+
+        self.set_status("Running employee efficiency...")
+
+        def worker():
+            from app.collector import run_employee_efficiency_for_companies, persist_companies
+            results = run_employee_efficiency_for_companies(self.companies, base_settings=self.settings)
+            try:
+                persist_companies(self.companies)
+            except Exception:
+                pass
+
+            def finish():
+                messages = []
+                for name, res in results:
+                    if res.ok:
+                        line = f"{name}: OK ({res.employee_count} employees, {res.misplaced_count} misplaced)"
+                        if getattr(res, "verification_note", ""):
+                            line += f"\n    \u26a0 {res.verification_note}"
+                        messages.append(line)
+                    else:
+                        messages.append(f"{name}: FAIL - {res.message}")
+                self.set_status("Employee efficiency run complete.")
+                self.refresh_from_sheet()
+                messagebox.showinfo("Employee Efficiency Results", "\n".join(messages))
+            self.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def run_everything(self):
+        """Run both a Snapshot and an Employee Efficiency pass for every
+        configured company, in one click."""
+        if not self.companies:
+            messagebox.showinfo(
+                "No companies configured",
+                "Add at least one company (Torn API key required, Google Sheet ID optional) in Settings first.",
+            )
+            return
+
+        self.set_status("Running snapshot + employee efficiency...")
+
+        def worker():
+            from app.collector import run_everything_for_companies, persist_companies
+            results = run_everything_for_companies(self.companies, base_settings=self.settings)
+            try:
+                persist_companies(self.companies)
+            except Exception:
+                pass
+
+            def finish():
+                messages = []
+                for name, res in results:
+                    if res.ok:
+                        s, e = res.snapshot, res.employee_efficiency
+                        parts = [f"Snapshot OK ({s.employee_count} employees, {s.stock_count} stock)" if s.ok else f"Snapshot FAIL - {s.message}"]
+                        if e.ok:
+                            eff_part = f"Efficiency OK ({e.misplaced_count} misplaced)"
+                            if getattr(e, "verification_note", ""):
+                                eff_part += f" [\u26a0 {e.verification_note}]"
+                            parts.append(eff_part)
+                        else:
+                            parts.append(f"Efficiency FAIL - {e.message}")
+                        messages.append(f"{name}: " + "; ".join(parts))
+                    else:
+                        messages.append(f"{name}: {res.message}")
+                self.set_status("Run Everything complete.")
+                self.refresh_from_sheet()
+                messagebox.showinfo("Run Everything Results", "\n".join(messages))
+            self.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def refresh_from_sheet(self):
         self.set_status("Refreshing from sheet...")
 
@@ -773,6 +1367,7 @@ class MainWindow(tk.Tk):
         try:
             self._populate_overview()
             self._populate_employees()
+            self._populate_position_efficiency()
             self._populate_stock()
             self._populate_trends()
             if not silent:
@@ -790,6 +1385,16 @@ class MainWindow(tk.Tk):
             self.set_status(f"Refresh failed: {e}")
 
     # ---------------------------------------------------------------- io --
+    def _active_company(self) -> dict | None:
+        """Return the actual company dict (same object as in self.companies,
+        so mutating it and calling companies_mod.save_companies(self.companies)
+        persists it) for the currently selected company, or None."""
+        sel = (self.company_var.get() or "").strip()
+        for c in self.companies:
+            if c.get("name") == sel:
+                return c
+        return self.companies[0] if self.companies else None
+
     def _active_company_sheet_override(self) -> tuple:
         """Return (sheet_id, sheet_name) for the currently selected company (or empty strings)."""
         sel = (self.company_var.get() or "").strip()
@@ -836,21 +1441,30 @@ class MainWindow(tk.Tk):
         name = simpledialog.askstring("Company name", "Name for company", parent=self)
         if not name:
             return
-        torn = simpledialog.askstring("Torn API key", "Company's limited Torn API key (required)", parent=self, show="*")
+        torn = simpledialog.askstring("Torn API key", "Company's limited-access Torn API key (required)", parent=self, show="*")
         if not (torn or "").strip():
             messagebox.showwarning("Torn API key required", "Each company needs its own Torn API key.")
             return
+        torn_public = simpledialog.askstring(
+            "Torn Public API key",
+            "Company's Public Torn API key (optional - only needed for the Health Score "
+            "ranking, which reads other companies' public listings)",
+            parent=self, show="*",
+        )
         tornstats = simpledialog.askstring("Tornstats API key", "Tornstats API key (optional)", parent=self, show="*")
-        sheet_id = simpledialog.askstring("Google Sheet ID", "ID of the Google Sheet shared with this user (required)", parent=self)
-        if not (sheet_id or "").strip():
-            messagebox.showwarning("Sheet ID required", "Each company needs the ID of its own Google Sheet.")
-            return
+        sheet_id = simpledialog.askstring(
+            "Google Sheet ID",
+            "ID of an existing Google Sheet to use (optional - leave blank and a new "
+            "Sheet named after this company will be created automatically on first run)",
+            parent=self,
+        )
         sheet_name = simpledialog.askstring("Google Sheet name", "Optional display name", parent=self)
         entry = {
             "name": name.strip(),
             "torn_api_key": torn.strip(),
+            "torn_public_api_key": (torn_public or "").strip(),
             "tornstats_api_key": (tornstats or "").strip(),
-            "google_sheet_id": sheet_id.strip(),
+            "google_sheet_id": (sheet_id or "").strip(),
             "google_sheet_name": (sheet_name or "").strip(),
         }
         self.companies.append(entry)
@@ -870,21 +1484,30 @@ class MainWindow(tk.Tk):
         name = simpledialog.askstring("Company name", "Name for company", initialvalue=c.get("name", ""), parent=self)
         if not name:
             return
-        torn = simpledialog.askstring("Torn API key", "Company's limited Torn API key (required)", initialvalue=c.get("torn_api_key", ""), parent=self, show="*")
+        torn = simpledialog.askstring("Torn API key", "Company's limited-access Torn API key (required)", initialvalue=c.get("torn_api_key", ""), parent=self, show="*")
         if not (torn or "").strip():
             messagebox.showwarning("Torn API key required", "Each company needs its own Torn API key.")
             return
+        torn_public = simpledialog.askstring(
+            "Torn Public API key",
+            "Company's Public Torn API key (optional - only needed for the Health Score "
+            "ranking, which reads other companies' public listings)",
+            initialvalue=c.get("torn_public_api_key", ""), parent=self, show="*",
+        )
         tornstats = simpledialog.askstring("Tornstats API key", "Tornstats API key (optional)", initialvalue=c.get("tornstats_api_key", ""), parent=self, show="*")
-        sheet_id = simpledialog.askstring("Google Sheet ID", "ID of the Google Sheet shared with this user (required)", initialvalue=c.get("google_sheet_id", ""), parent=self)
-        if not (sheet_id or "").strip():
-            messagebox.showwarning("Sheet ID required", "Each company needs the ID of its own Google Sheet.")
-            return
+        sheet_id = simpledialog.askstring(
+            "Google Sheet ID",
+            "ID of an existing Google Sheet to use (optional - leave blank and a new "
+            "Sheet named after this company will be created automatically on next run)",
+            initialvalue=c.get("google_sheet_id", ""), parent=self,
+        )
         sheet_name = simpledialog.askstring("Google Sheet name", "Optional display name", initialvalue=c.get("google_sheet_name", ""), parent=self)
         c.update({
             "name": name.strip(),
             "torn_api_key": torn.strip(),
+            "torn_public_api_key": (torn_public or "").strip(),
             "tornstats_api_key": (tornstats or "").strip(),
-            "google_sheet_id": sheet_id.strip(),
+            "google_sheet_id": (sheet_id or "").strip(),
             "google_sheet_name": (sheet_name or "").strip(),
         })
         try:
@@ -912,4 +1535,14 @@ class MainWindow(tk.Tk):
 
 def launch():
     app = MainWindow()
+    style = ttk.Style(app)
+    # The native Windows theme ('vista'/'winnative') draws column headings
+    # via the OS header control, which has a fixed single-line height that
+    # clips any second line regardless of padding. 'clam' draws headings
+    # itself and actually expands to fit multi-line text - needed for the
+    # Employees tab's full v2 column set, several of which use \n headers.
+    if "clam" in style.theme_names():
+        style.theme_use("clam")
+    style.configure("Treeview", rowheight=24)
+    style.configure("Treeview.Heading", padding=(6, 8, 6, 8))
     app.mainloop()
