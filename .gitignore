@@ -15,10 +15,10 @@ service-account.json
 companies.json
 *.dpapi
 oauth-client.json
-client_secret_263225609669-s0nblqo7ulaanfr4ebr43gchke0jposa.apps.googleusercontent.com.json
-client_secret_2_263225609669-s0nblqo7ulaanfr4ebr43gchke0jposa.apps.googleusercontent.com.json
+client_secret_263225609669-sljo3372608mh7q6vbni10p0v07gr8tc.apps.googleusercontent.com
 opencode.json
 AGENTS.md
+client_secret_*.json
 
 # User-specific files (MonoDevelop/Xamarin Studio)
 *.userprefs
