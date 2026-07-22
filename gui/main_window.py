@@ -171,34 +171,44 @@ _EFFECTIVENESS_COLOR_STOPS = [
 ]
 
 
-def _effectiveness_color(value) -> str:
-    """Work-stats effectiveness percentage -> "#rrggbb" cell color, per
-    _EFFECTIVENESS_COLOR_STOPS. Values are clamped to the stop range, so
-    anything at/above 110% renders as the same dark green as exactly 110%."""
-    try:
-        v = float(value)
-    except (TypeError, ValueError):
-        v = 0.0
-    v = max(0.0, min(v, _EFFECTIVENESS_COLOR_STOPS[-1][0]))
-    for (v0, c0), (v1, c1) in zip(_EFFECTIVENESS_COLOR_STOPS, _EFFECTIVENESS_COLOR_STOPS[1:]):
-        if v0 <= v <= v1:
-            t = (v - v0) / (v1 - v0) if v1 != v0 else 0.0
-            r = round(c0[0] + (c1[0] - c0[0]) * t)
-            g = round(c0[1] + (c1[1] - c0[1]) * t)
-            b = round(c0[2] + (c1[2] - c0[2]) * t)
+def _effectiveness_color(value):
+    """
+    Continuous gradient:
+        0   -> Red
+        50  -> Orange
+        80  -> Yellow
+        100 -> Light Green
+        120 -> Green
+        140+-> Dark Green
+    """
+    value = max(0, min(140, float(value)))
+    stops = [
+        (0,   (200,  50,  50)),   # red
+        (50,  (235, 120,  40)),   # orange
+        (80,  (245, 210,  60)),   # yellow
+        (100, (150, 220, 100)),   # light green
+        (120, ( 80, 180,  80)),   # green
+        (140, ( 30, 120,  50)),   # dark green
+    ]
+    for i in range(len(stops)-1):
+        v1, c1 = stops[i]
+        v2, c2 = stops[i+1]
+        if value <= v2:
+            t = (value - v1) / (v2 - v1)
+            r = int(c1[0] + (c2[0]-c1[0]) * t)
+            g = int(c1[1] + (c2[1]-c1[1]) * t)
+            b = int(c1[2] + (c2[2]-c1[2]) * t)
             return f"#{r:02x}{g:02x}{b:02x}"
-    r, g, b = _EFFECTIVENESS_COLOR_STOPS[-1][1]
-    return f"#{r:02x}{g:02x}{b:02x}"
+    return "#1e7832"
 
 
-def _readable_text_color(hex_background: str) -> str:
-    """Black or white text, whichever reads better on the given background,
-    by standard perceptual luminance - so cell labels stay legible across
-    the whole red-to-green gradient without hand-tuning per color stop."""
-    hex_background = hex_background.lstrip("#")
-    r, g, b = (int(hex_background[i:i + 2], 16) for i in (0, 2, 4))
-    luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255
-    return "#000000" if luminance > 0.55 else "#ffffff"
+def _readable_text_color(bg):
+    bg = bg.lstrip("#")
+    r = int(bg[0:2], 16)
+    g = int(bg[2:4], 16)
+    b = int(bg[4:6], 16)
+    brightness = (r*299 + g*587 + b*114) / 1000
+    return "#000000" if brightness > 150 else "#ffffff"
 
 
 # Full Employees table column set, in order: (header, row_key). Headers use
@@ -399,10 +409,97 @@ class PositionCapacitiesDialog(tk.Toplevel):
         self.destroy()
 
 
+class PositionVisibilityDialog(tk.Toplevel):
+    """Modal checklist for which positions show as columns on the Position
+    Effectiveness grid, plus a free-text way to add a position by hand.
+
+    This exists because there's no fully reliable automatic source for "every
+    position this company type has" - Tornstats' own /efficiency response is
+    the best one available, but it can omit a real position outright (seen
+    firsthand: it never returned "Inspector" for this Oil Rig company even
+    though it's a real, selectable position in-game). Rather than silently
+    dropping a position no automatic source reports, this hands control to
+    the user: check/uncheck what's already been detected, or type in
+    anything missing so it always shows going forward (its cells just read
+    "n/a" instead of a percentage until/unless a projection for it is ever
+    found).
+
+    self.result ends up as {"visible": [position_name, ...]} - every
+    position name known (detected or manually added) that's currently
+    checked - or None if cancelled."""
+
+    def __init__(self, master, all_positions, hidden_positions):
+        super().__init__(master)
+        self.title("Configure Positions")
+        self.resizable(False, False)
+        self.result = None
+        self.transient(master)
+        self.grab_set()
+
+        self.positions = list(all_positions)
+        hidden = set(hidden_positions or [])
+        self.vars = {pos: tk.BooleanVar(value=pos not in hidden) for pos in self.positions}
+
+        ttk.Label(
+            self,
+            text=(
+                "Choose which positions appear as columns on the Position\n"
+                "Effectiveness grid. Don't see one that should be here (e.g. a\n"
+                "position Tornstats doesn't report)? Add it by name below."
+            ),
+            justify="left",
+        ).pack(anchor="w", padx=12, pady=(12, 8))
+
+        self.rows_frame = ttk.Frame(self)
+        self.rows_frame.pack(fill="both", expand=True, padx=12)
+        self._render_rows()
+
+        add_row = ttk.Frame(self)
+        add_row.pack(fill="x", padx=12, pady=(8, 0))
+        ttk.Label(add_row, text="Add position:").pack(side="left")
+        self.add_var = tk.StringVar()
+        entry = ttk.Entry(add_row, textvariable=self.add_var, width=24)
+        entry.pack(side="left", padx=(6, 6))
+        entry.bind("<Return>", lambda e: self._add_position())
+        ttk.Button(add_row, text="Add", command=self._add_position).pack(side="left")
+
+        btn_row = ttk.Frame(self)
+        btn_row.pack(pady=12)
+        ttk.Button(btn_row, text="Select All", command=self._select_all).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="Save", command=self._save).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="Cancel", command=self.destroy).pack(side="left", padx=4)
+
+    def _render_rows(self):
+        for widget in self.rows_frame.winfo_children():
+            widget.destroy()
+        cols = 2
+        for i, pos in enumerate(self.positions):
+            ttk.Checkbutton(self.rows_frame, text=pos, variable=self.vars[pos]).grid(
+                row=i // cols, column=i % cols, sticky="w", padx=6, pady=2
+            )
+
+    def _add_position(self):
+        name = self.add_var.get().strip()
+        self.add_var.set("")
+        if not name or name in self.positions:
+            return
+        self.positions.append(name)
+        self.vars[name] = tk.BooleanVar(value=True)
+        self._render_rows()
+
+    def _select_all(self):
+        for var in self.vars.values():
+            var.set(True)
+
+    def _save(self):
+        self.result = {"visible": [pos for pos in self.positions if self.vars[pos].get()]}
+        self.destroy()
+
+
 class MainWindow(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Knotty Oil Tracker")
+        self.title("Torn - Company Assistant")
 
         self.settings = Settings.load()
         # Company settings, including API keys, are DPAPI-encrypted for this user.
@@ -804,27 +901,64 @@ class MainWindow(tk.Tk):
         top = ttk.Frame(self.position_heatmap_tab)
         top.pack(fill="x", padx=10, pady=10)
         ttk.Button(top, text="Refresh", command=self.refresh_from_sheet).pack(side="left")
+        ttk.Button(top, text="Configure Positions", command=self._configure_heatmap_positions).pack(side="left", padx=(6, 0))
         ttk.Label(
             top,
             text="Tornstats-projected work-stats effectiveness for every employee at every position "
                  "this company offers. Read straight from Position_Efficiency (Run Employee Efficiency "
                  "Now to update). Each employee's current position is boxed.",
             foreground="#555555",
-            wraplength=560, justify="left",
+            wraplength=460, justify="left",
         ).pack(side="left", padx=10)
 
         legend = ttk.Frame(self.position_heatmap_tab)
         legend.pack(fill="x", padx=10)
         ttk.Label(legend, text="Effectiveness:", foreground="#555555").pack(side="left")
-        for label, sample_value in (("<50%", 25), ("50-69%", 60), ("70-89%", 80), ("90-109%", 100), ("110%+", 120)):
+        for label, sample_value in (("<50", 25), ("50-69", 60), ("70-89", 80), ("90-109", 100), ("110+", 120)):
             color = _effectiveness_color(sample_value)
             tk.Label(
                 legend, text=label, background=color, foreground=_readable_text_color(color),
                 width=8, relief="solid", borderwidth=1,
             ).pack(side="left", padx=(6, 0))
+        tk.Label(legend, text="n/a", background="#e8e8e8", foreground="#777777",
+                 width=8, relief="solid", borderwidth=1).pack(side="left", padx=(6, 0))
+        ttk.Label(legend, text=" = no projection available for that position yet", foreground="#555555").pack(side="left")
 
+        # Header lives inside the SAME scrollable grid as the data rows (row
+        # 0), not a separate frame - two independent grid containers size
+        # their columns independently even with matching column indexes, so
+        # a separate header frame drifts out of alignment with the body as
+        # soon as any column's natural width differs between the two. One
+        # shared grid guarantees the columns actually line up, and scrolls
+        # the header along with the data for free.
         grid_frame, self.heatmap_canvas, self.heatmap_grid = self._make_scrollable_grid(self.position_heatmap_tab)
         grid_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+    def _configure_heatmap_positions(self):
+        company = self._active_company()
+        if not company:
+            messagebox.showinfo("No company selected", "Select or add a company first.")
+            return
+        all_positions = sorted(set(getattr(self, "_heatmap_all_positions", []) or []) | set(company.get("last_known_positions") or []))
+        if not all_positions:
+            messagebox.showinfo(
+                "Configure Positions",
+                "No positions detected yet for this company - run Employee Efficiency first so "
+                "positions can be read from Tornstats, then Configure Positions to add any it missed.",
+            )
+            return
+        dialog = PositionVisibilityDialog(self, all_positions, company.get("heatmap_hidden_positions") or [])
+        self.wait_window(dialog)
+        if dialog.result:
+            visible = set(dialog.result["visible"])
+            company["last_known_positions"] = sorted(set(all_positions) | visible)
+            company["heatmap_hidden_positions"] = sorted(set(all_positions) - visible)
+            try:
+                companies_mod.save_companies(self.companies)
+            except Exception:
+                messagebox.showerror("Save failed", "Could not save companies to companies.json")
+                return
+            self._populate_position_efficiency()
 
     def _populate_position_efficiency(self):
         for widget in self.heatmap_grid.winfo_children():
@@ -836,24 +970,50 @@ class MainWindow(tk.Tk):
                 self.heatmap_grid, text="No data yet - run Employee Efficiency first.",
                 background="#ffffff", padx=10, pady=10,
             ).grid(row=0, column=0, sticky="w")
+            self._heatmap_all_positions = []
             return
 
         meta_cols = {"tId", "name", "current_position"}
-        position_names = [k for k in records[0].keys() if k not in meta_cols]
+        detected_positions = [k for k in records[0].keys() if k not in meta_cols]
+        company = self._active_company() or {}
+        # Union everything ever seen for this position column - this run's
+        # sheet, plus anything manually added/kept via Configure Positions -
+        # so a position an automatic source drops (e.g. Tornstats never
+        # reporting "Inspector") doesn't just vanish once it's been added by
+        # hand. Filtered by whatever's been unchecked in that same dialog.
+        known_positions = sorted(set(detected_positions) | set(company.get("last_known_positions") or []))
+        self._heatmap_all_positions = known_positions
+        hidden = set(company.get("heatmap_hidden_positions") or [])
+        position_names = [p for p in known_positions if p not in hidden]
+
         rows = sorted(records, key=lambda r: str(r.get("name", "")).lower())
 
-        def cell_value(row, pos):
+        def cell_text_and_color(row, pos):
+            if pos not in row or row.get(pos) in (None, ""):
+                return "n/a", "#e8e8e8", "#777777"
             try:
-                return float(row.get(pos) or 0)
+                value = float(row.get(pos))
             except (TypeError, ValueError):
-                return 0.0
+                return "n/a", "#e8e8e8", "#777777"
+            color = _effectiveness_color(value)
+            return f"{value:.0f}", color, _readable_text_color(color)
 
-        headers = ["Name", "Current Position", "Current Eff."] + position_names
-        for col, header in enumerate(headers):
+        # Fixed, explicit per-column character widths - shared identically
+        # between the header cell and every data cell in that column - so
+        # columns size deterministically instead of drifting depending on
+        # whether a Label's natural width came from wrapped header text vs.
+        # unwrapped cell text (the previous source of the misalignment).
+        name_width = max([9] + [len(str(r.get("name", ""))) for r in rows]) 
+        position_col_width = max([10] + [len(p) for p in position_names])
+        current_pos_width = max([len("Current Position")] + [len(str(r.get("current_position") or "")) for r in rows])
+
+        headers = [("Name", name_width), ("Current Position", current_pos_width), ("Current Eff.", 12)]
+        headers += [(pos, position_col_width) for pos in position_names]
+        for col, (header, width) in enumerate(headers):
             tk.Label(
                 self.heatmap_grid, text=header, font=("TkDefaultFont", 9, "bold"),
-                background="#e0e0e0", padx=8, pady=4, relief="ridge", borderwidth=1,
-                wraplength=100, justify="center",
+                background="#e0e0e0", relief="ridge", borderwidth=1,
+                width=width, anchor="center", padx=4, pady=4,
             ).grid(row=0, column=col, sticky="nsew")
 
         for i, r in enumerate(rows, start=1):
@@ -861,37 +1021,33 @@ class MainWindow(tk.Tk):
             current = r.get("current_position") or ""
 
             tk.Label(
-                self.heatmap_grid, text=name, anchor="w", padx=8, pady=3,
+                self.heatmap_grid, text=name, anchor="w", padx=6, pady=3, width=name_width,
                 background="#ffffff", relief="ridge", borderwidth=1,
             ).grid(row=i, column=0, sticky="nsew")
             tk.Label(
-                self.heatmap_grid, text=current, anchor="w", padx=8, pady=3,
+                self.heatmap_grid, text=current, anchor="w", padx=6, pady=3, width=current_pos_width,
                 background="#ffffff", relief="ridge", borderwidth=1,
             ).grid(row=i, column=1, sticky="nsew")
 
-            current_value = cell_value(r, current) if current in position_names else 0.0
-            current_color = _effectiveness_color(current_value)
+            cur_text, cur_bg, cur_fg = cell_text_and_color(r, current) if current else ("n/a", "#e8e8e8", "#777777")
             tk.Label(
-                self.heatmap_grid, text=f"{current_value:.0f}%", anchor="center", padx=8, pady=3,
-                background=current_color, foreground=_readable_text_color(current_color),
+                self.heatmap_grid, text=cur_text, anchor="center", padx=6, pady=3, width=12,
+                background=cur_bg, foreground=cur_fg,
                 font=("TkDefaultFont", 9, "bold"), relief="ridge", borderwidth=1,
             ).grid(row=i, column=2, sticky="nsew")
 
             for j, pos in enumerate(position_names, start=3):
-                value = cell_value(r, pos)
-                color = _effectiveness_color(value)
+                text, bg, fg = cell_text_and_color(r, pos)
                 is_current = pos == current
                 # Boxed (thicker, solid-relief) cell marks the employee's
                 # current position, replacing the old chart's outlined
                 # rectangle - same "you are here" purpose, plain-grid form.
                 tk.Label(
-                    self.heatmap_grid, text=f"{value:.0f}%", anchor="center", padx=8, pady=3,
-                    background=color, foreground=_readable_text_color(color),
+                    self.heatmap_grid, text=text, anchor="center", padx=6, pady=3, width=position_col_width,
+                    background=bg, foreground=fg,
                     relief="solid" if is_current else "ridge",
                     borderwidth=3 if is_current else 1,
                 ).grid(row=i, column=j, sticky="nsew")
-
-
 
     # ------------------------------------------------------------ stock --
     def _build_stock_tab(self):

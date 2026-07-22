@@ -51,11 +51,33 @@ doesn't happen - see EmployeeEfficiencyResult.verification_note.
 
 from __future__ import annotations
 
+import logging
 from typing import Dict, List, Optional, Set, Tuple
 
+from .companies import PROJECT_ROOT
 from .tornstats_api import TornStatsAPI, TornStatsAPIError
 
 NON_POSITION_KEYS = {"company", "stats", "status", "message"}
+
+# Every Tornstats company-type-block match (director AND per-employee) gets
+# logged here: the id/name we expected, which block key actually got used,
+# its "company" label, and the full position:value list - so "is the app
+# really reading the right block" is something you can go check on disk
+# instead of having to trust it. Deliberately a plain, always-on FileHandler
+# (not GUI-surfaced) since this fires once per employee per run and would be
+# noisy in the UI; the GUI only ever shows the summarized verification_note.
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    try:
+        log_dir = PROJECT_ROOT / "logs"
+        log_dir.mkdir(exist_ok=True)
+        _handler = logging.FileHandler(log_dir / "efficiency_verification.log", encoding="utf-8")
+        _handler.setFormatter(logging.Formatter("%(asctime)s  %(message)s"))
+        logger.addHandler(_handler)
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+    except Exception:
+        pass  # non-fatal - verification just won't be written to disk this run
 
 EMPLOYEE_HEADERS = [
     "tId", "name", "current_position", "wage", "days_in_company", "last_action_ts",
@@ -74,6 +96,7 @@ def find_company_type_block(
     known_position_names: set,
     expected_company_type_id: Optional[int] = None,
     expected_company_type_name: Optional[str] = None,
+    context: str = "",
 ) -> Tuple[Optional[dict], str]:
     """Pick the block from a Tornstats /efficiency response that belongs to
     this company, trying progressively less-reliable signals:
@@ -93,33 +116,59 @@ def find_company_type_block(
 
     Returns (block_or_None, method) - method is always one of the four
     strings above, even when block is None, so callers can tell *why* a
-    lookup failed/degraded instead of just that it did."""
+    lookup failed/degraded instead of just that it did.
+
+    context: a short label ("director" / "employee 'Bob' (id=123)") used
+    only for the verification log line this always writes to
+    logs/efficiency_verification.log - company id/name expected, which key
+    actually matched and how, the block's own "company" label, and the full
+    position:value list it found. This is the record to check when in doubt
+    about whether the app is really reading the right block."""
+    block, method, block_key = None, "none", None
+
     if expected_company_type_id is not None:
-        block = efficiency_response.get(str(expected_company_type_id))
-        if isinstance(block, dict) and "company" in block:
-            return block, "id"
+        candidate_key = str(expected_company_type_id)
+        candidate = efficiency_response.get(candidate_key)
+        if isinstance(candidate, dict) and "company" in candidate:
+            block, method, block_key = candidate, "id", candidate_key
 
-    if expected_company_type_name:
+    if block is None and expected_company_type_name:
         wanted = expected_company_type_name.strip().lower()
-        for key, block in efficiency_response.items():
-            if key in NON_POSITION_KEYS or not isinstance(block, dict):
+        for key, candidate in efficiency_response.items():
+            if key in NON_POSITION_KEYS or not isinstance(candidate, dict):
                 continue
-            if str(block.get("company", "")).strip().lower() == wanted:
-                return block, "name"
+            if str(candidate.get("company", "")).strip().lower() == wanted:
+                block, method, block_key = candidate, "name", key
+                break
 
-    if known_position_names:
-        best_block, best_size = None, None
-        for key, block in efficiency_response.items():
-            if key in NON_POSITION_KEYS or not isinstance(block, dict):
+    if block is None and known_position_names:
+        best_block, best_key, best_size = None, None, None
+        for key, candidate in efficiency_response.items():
+            if key in NON_POSITION_KEYS or not isinstance(candidate, dict):
                 continue
-            position_names = set(block.keys()) - {"company"}
+            position_names = set(candidate.keys()) - {"company"}
             if known_position_names.issubset(position_names):
                 if best_size is None or len(position_names) < best_size:
-                    best_block, best_size = block, len(position_names)
+                    best_block, best_key, best_size = candidate, key, len(position_names)
         if best_block is not None:
-            return best_block, "heuristic"
+            block, method, block_key = best_block, "heuristic", best_key
 
-    return None, "none"
+    if block is not None:
+        positions = {k: v for k, v in block.items() if k != "company"}
+        logger.info(
+            "%s: expected_id=%s expected_name=%r -> matched block_key=%r method=%s "
+            "block_company=%r positions=%s",
+            context or "lookup", expected_company_type_id, expected_company_type_name,
+            block_key, method, block.get("company"), positions,
+        )
+    else:
+        logger.warning(
+            "%s: expected_id=%s expected_name=%r -> NO MATCH (checked %d block(s))",
+            context or "lookup", expected_company_type_id, expected_company_type_name,
+            len([k for k in efficiency_response if k not in NON_POSITION_KEYS]),
+        )
+
+    return block, method
 
 
 def compute_employee_rows(
@@ -185,7 +234,8 @@ def compute_employee_rows(
                 end=stats.get("endurance"),
             )
             block, method = find_company_type_block(
-                resp, known_positions, expected_company_type_id, expected_company_type_name
+                resp, known_positions, expected_company_type_id, expected_company_type_name,
+                context=f"employee '{emp.get('name', '')}' (id={emp.get('id')})",
             )
             match_methods.add(method)
             if block:

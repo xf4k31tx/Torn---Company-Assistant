@@ -61,6 +61,7 @@ from typing import Optional
 from .config import Settings
 from .efficiency_calc import (
     EMPLOYEE_HEADERS, assign_positions, build_position_efficiency_rows, compute_employee_rows,
+    find_company_type_block,
 )
 from .profit_calc import compute_avg_daily_income_7day, compute_avg_daily_profit_7day, compute_row_profit_fields
 from .sheets_client import SheetsClient
@@ -463,15 +464,32 @@ class Collector:
         }
 
         # ----------------------------------------------- director effic. --
+        # Was previously looping over every block Tornstats returns (every
+        # company type in the game, ~25-30 of them) with no filtering at
+        # all, so Director_Efficiency ended up with rows for Hair Salon, Law
+        # Firm, etc. alongside this company's real numbers. Now matched the
+        # same verified way as the per-employee lookups (company_type id
+        # first, see find_company_type_block) so only this company's block
+        # is ever written - and it's logged to logs/efficiency_verification.log
+        # either way so a mismatch is visible instead of silent.
+        type_block = profile.get("type") or {}
+        director_company_type_id = type_block.get("id")
+        director_company_type_name = type_block.get("name")
+        director_known_positions = {e.get("position", {}).get("name") for e in employees if e.get("position")}
+        director_known_positions.discard(None)
+
         tornstats_key = self._tornstats_key()
         director_rows = []
         if tornstats_key:
             tornstats = TornStatsAPI(api_key=tornstats_key)
             try:
                 eff_data = tornstats.get_efficiency()
-                for _, block in eff_data.items():
-                    if not isinstance(block, dict) or "company" not in block:
-                        continue
+                block, _method = find_company_type_block(
+                    eff_data, director_known_positions,
+                    director_company_type_id, director_company_type_name,
+                    context="director",
+                )
+                if block:
                     for position, value in block.items():
                         if position == "company":
                             continue
@@ -565,6 +583,15 @@ class Collector:
             employees, tornstats,
             expected_company_type_id=company_type_id,
             expected_company_type_name=company_type_name,
+        )
+
+        # Grow, never shrink, automatically - a position that stops showing
+        # up in this run (e.g. the last person in it just quit) shouldn't
+        # silently disappear from the sheet/GUI's column list. Positions are
+        # only ever removed by an explicit, user-driven action (the Position
+        # Effectiveness tab's "Configure Positions" checklist), never here.
+        self.company["last_known_positions"] = sorted(
+            set(self.company.get("last_known_positions") or []) | set(position_names)
         )
 
         capacities = self.company.get("position_capacities") or {}
