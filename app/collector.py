@@ -109,8 +109,17 @@ EFFECTIVENESS_KEYS = [
     "inactivity", "management", "book", "merits", "total",
 ]
 
-MISPLACED_THRESHOLD = 15
 STOCKOUT_SOON_DAYS = 3
+
+
+def is_employee_misplaced(row: dict) -> bool:
+    current_position = str(row.get("current_position") or "").strip()
+    assigned_position = str(row.get("assigned_position") or "").strip()
+    return bool(
+        current_position
+        and assigned_position
+        and current_position != assigned_position
+    )
 
 
 def _ts_to_date(ts: int) -> str:
@@ -596,18 +605,27 @@ class Collector:
 
         capacities = self.company.get("position_capacities") or {}
         priority_order = self.company.get("position_priority_order") or []
-        assign_positions(rows, position_names, capacities, total_capacity, priority_order)
+        locked_employee_ids = {
+            str(employee_id)
+            for employee_id in (self.company.get("locked_employee_ids") or [])
+        }
+        lock_warnings = assign_positions(
+            rows,
+            position_names,
+            capacities,
+            total_capacity,
+            priority_order,
+            locked_employee_ids,
+        )
+        if lock_warnings:
+            verification_note = " ".join(
+                part for part in [verification_note, *lock_warnings] if part
+            )
 
         # ------------------------------------------ misplaced + wage eff --
         misplaced_count = 0
         for row in rows:
-            current_eff = row.get("projected_efficiency_current_position")
-            best_eff = row.get("best_fit_efficiency")
-            misplaced = (
-                current_eff not in ("", None)
-                and best_eff not in ("", None)
-                and (best_eff - current_eff) >= MISPLACED_THRESHOLD
-            )
+            misplaced = is_employee_misplaced(row)
             row["misplaced_flag"] = misplaced
             if misplaced:
                 misplaced_count += 1

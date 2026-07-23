@@ -153,12 +153,112 @@ def format_field(field_name: str, value, tab: str) -> str:
     return str(value)
 
 
+def format_employee_field(field_name: str, row: dict) -> str:
+    if field_name == "time_since_last_action":
+        return format_time_since(row.get("last_action_ts"))
+    value = row.get(field_name, "")
+    formatted = format_field(field_name, value, "Employee_Effectiveness")
+    if field_name in {"effectiveness_addiction", "effectiveness_inactivity"}:
+        try:
+            if float(value) <= -10:
+                return f"\u26a0 {formatted}"
+        except (TypeError, ValueError):
+            pass
+    return formatted
+
+
+EMPLOYEE_FOOTER_TOTAL_COLUMNS = {
+    "wage",
+    "effectiveness_total",
+    "effectiveness_working_stats",
+    "effectiveness_addiction",
+    "effectiveness_inactivity",
+    "assigned_efficiency",
+}
+
+
+def employee_footer_total(records, field_name):
+    total = 0.0
+    found_numeric_value = False
+    for row in records:
+        try:
+            value = row.get(field_name)
+            if isinstance(value, str):
+                value = value.replace(",", "").replace("$", "").strip()
+            total += float(value)
+            found_numeric_value = True
+        except (TypeError, ValueError):
+            continue
+    if not found_numeric_value:
+        return ""
+    return f"{total:,.2f}".rstrip("0").rstrip(".")
+
+
+def scroll_canvas_xview(canvas, *args):
+    canvas.xview(*args)
+    canvas.update_idletasks()
+
+
+def company_selector_values(companies):
+    names = [company.get("name", "Unnamed") for company in companies]
+    return names or ["(No companies configured)"]
+
+
+def employee_cell_style(field_name: str, row: dict, base_background="#ffffff"):
+    if field_name == "current_position":
+        current_position = str(row.get("current_position") or "").strip()
+        assigned_position = str(row.get("assigned_position") or "").strip()
+        if assigned_position:
+            if current_position == assigned_position:
+                return "#d4edda", "#155724"
+            return "#f8d7da", "#721c24"
+    if field_name in {"effectiveness_addiction", "effectiveness_inactivity"}:
+        try:
+            if float(row.get(field_name)) <= -10:
+                return "#f8d7da", "#721c24"
+        except (TypeError, ValueError):
+            pass
+    return base_background, "#000000"
+
+
+def position_efficiency_score_style(value):
+    if value in (None, ""):
+        return "", "#e8e8e8", "#777777"
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return "", "#e8e8e8", "#777777"
+    rounded_score = int(round(score))
+    if rounded_score < 50:
+        background = "#c62828"
+    elif rounded_score < 75:
+        background = "#ef6c00"
+    elif rounded_score < 100:
+        background = "#f9c74f"
+    elif rounded_score < 125:
+        background = "#66bb6a"
+    else:
+        background = "#1b5e20"
+    return str(rounded_score), background, _readable_text_color(background)
+
+
+def position_efficiency_sort_value(record: dict, column: str):
+    key = (record.get("current_position") or "") if column == "current_efficiency" else column
+    value = record.get(key, "")
+    if column in {"name", "current_position"}:
+        return str(value).lower()
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("-inf")
+
+
 # Work-stats-effectiveness color grading for the Position Effectiveness tab.
 # Torn/Tornstats don't publish exact color/threshold values for this anywhere
 # (checked - there's no documented spec, just "red is bad, green is good"
 # from players' own screenshots/descriptions), so this reproduces the same
 # red -> orange -> yellow -> light green -> dark green gradient the old
-# heatmap tab already used (matplotlib's "RdYlGn" colormap) as a set of
+# position_efficiency tab already used (matplotlib's "RdYlGn" colormap) as a set of
 # named, continuously-interpolated stops instead of a matplotlib dependency,
 # so plain tk.Label cells can use it too. 100% = exactly meets a position's
 # stat requirement; below is under-qualified, above is over-qualified.
@@ -224,7 +324,7 @@ EMPLOYEE_TABLE_COLUMNS = [
     ("Intelligence", "intelligence"),
     ("Endurance", "endurance"),
     ("Total Eff.", "effectiveness_total"),
-    ("Working Stats\nEff.", "effectiveness_working_stats"),
+    ("Current Pos.\nEff.", "effectiveness_working_stats"),
     ("Settled In\nEff.", "effectiveness_settled_in"),
     ("Education\nEff.", "effectiveness_director_education"),
     ("Addiction\nEff.", "effectiveness_addiction"),
@@ -240,7 +340,7 @@ EMPLOYEE_TABLE_COLUMNS = [
     ("Misplaced", "misplaced_flag"),
     ("Wage\nEfficiency", "wage_efficiency"),
     ("Wage Eff.\nOutlier", "wage_efficiency_flag"),
-    ("Last Action", "last_action_ts"),
+    ("Time Since\nLast Action", "time_since_last_action"),
     ("tId", "tId"),
 ]
 
@@ -250,11 +350,18 @@ EMPLOYEE_TABLE_COLUMNS = [
 # a first-time user with all 26 columns at once.
 DEFAULT_VISIBLE_EMPLOYEE_COLUMNS = {
     "name", "current_position", "wage", "effectiveness_total",
-    "projected_efficiency_current_position", "best_fit_position", "best_fit_efficiency",
+    "effectiveness_working_stats", "best_fit_position", "best_fit_efficiency",
     "assigned_position", "assigned_efficiency", "misplaced_flag", "wage_efficiency_flag",
 }
 
 LEFT_ALIGNED_EMPLOYEE_COLUMNS = {"name", "current_position", "best_fit_position", "assigned_position"}
+POSITION_LOCK_COLUMN = "position_lock"
+
+
+def employee_position_is_locked(row, locked_employee_ids):
+    employee_id = str(row.get("tId") or "")
+    locked_ids = {str(value) for value in (locked_employee_ids or [])}
+    return bool(employee_id and employee_id in locked_ids)
 
 
 class ColumnPickerDialog(tk.Toplevel):
@@ -508,6 +615,7 @@ class MainWindow(tk.Tk):
         self.status_var = tk.StringVar(value="Ready.")
         # Active company selection - name of a company in self.companies.
         self.company_var = tk.StringVar(value=self.settings.last_selected_company or "")
+        self.company_combos = []
 
         self._build_menu()
         self._build_layout()
@@ -590,7 +698,11 @@ class MainWindow(tk.Tk):
         frame.columnconfigure(0, weight=1)
         canvas = tk.Canvas(frame, highlightthickness=0, background="#ffffff")
         vsb = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
-        hsb = ttk.Scrollbar(frame, orient="horizontal", command=canvas.xview)
+        hsb = ttk.Scrollbar(
+            frame,
+            orient="horizontal",
+            command=lambda *args: scroll_canvas_xview(canvas, *args),
+        )
         canvas.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
         canvas.grid(row=0, column=0, sticky="nsew")
         vsb.grid(row=0, column=1, sticky="ns")
@@ -616,6 +728,29 @@ class MainWindow(tk.Tk):
         canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
 
         return frame, canvas, inner
+
+    def _make_scrollable_canvas(self, parent):
+        frame = ttk.Frame(parent)
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        canvas = tk.Canvas(frame, highlightthickness=0, background="#ffffff")
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
+        hsb = ttk.Scrollbar(
+            frame,
+            orient="horizontal",
+            command=lambda *args: scroll_canvas_xview(canvas, *args),
+        )
+        canvas.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+
+        def _on_mousewheel(event):
+            canvas.yview_scroll(-1 * (event.delta // 120), "units")
+
+        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+        return frame, canvas
 
     def _autosize_columns(self, tree, min_width=60, max_width=420, padding=24):
         """Fits each column's width to its widest visible content (header or
@@ -654,21 +789,21 @@ class MainWindow(tk.Tk):
 
         self.overview_tab = ttk.Frame(self.notebook)
         self.employees_tab = ttk.Frame(self.notebook)
-        self.position_heatmap_tab = ttk.Frame(self.notebook)
+        self.position_position_efficiency_tab = ttk.Frame(self.notebook)
         self.stock_tab = ttk.Frame(self.notebook)
         self.trends_tab = ttk.Frame(self.notebook)
         self.settings_tab = ttk.Frame(self.notebook)
 
         self.notebook.add(self.overview_tab, text="Overview")
         self.notebook.add(self.employees_tab, text="Employees")
-        self.notebook.add(self.position_heatmap_tab, text="Position Heatmap")
+        self.notebook.add(self.position_position_efficiency_tab, text="Position Efficiency")
         self.notebook.add(self.stock_tab, text="Stock & Profit")
         self.notebook.add(self.trends_tab, text="Trends")
         self.notebook.add(self.settings_tab, text="Settings")
 
         self._build_overview_tab()
         self._build_employees_tab()
-        self._build_position_heatmap_tab()
+        self._build_position_position_efficiency_tab()
         self._build_stock_tab()
         self._build_trends_tab()
         self._build_settings_tab()
@@ -677,25 +812,41 @@ class MainWindow(tk.Tk):
         status_bar.pack(fill="x", side="bottom")
 
     # --------------------------------------------------------- overview --
+    def _add_company_selector(self, parent):
+        combo = ttk.Combobox(
+            parent,
+            textvariable=self.company_var,
+            values=company_selector_values(self.companies),
+            state="readonly",
+            width=30,
+        )
+        combo.pack(side="left", padx=8)
+        combo.bind("<<ComboboxSelected>>", lambda event: self._on_company_selected())
+        self.company_combos.append(combo)
+        return combo
+
+    def _update_company_selectors(self):
+        selector_values = company_selector_values(self.companies)
+        for combo in self.company_combos:
+            combo["values"] = selector_values
+        if self.company_var.get() not in selector_values:
+            self.company_var.set(selector_values[0])
+
     def _build_overview_tab(self):
         top = ttk.Frame(self.overview_tab)
         top.pack(fill="x", padx=10, pady=10)
 
         ttk.Button(top, text="Run Snapshot Now", command=self.run_snapshot).pack(side="left")
-        ttk.Button(top, text="Run Employee Efficiency Now", command=self.run_employee_efficiency).pack(side="left", padx=6)
         ttk.Button(top, text="Run Everything", command=self.run_everything).pack(side="left")
         ttk.Button(top, text="Refresh From Sheet", command=self.refresh_from_sheet).pack(side="left", padx=6)
 
         # Company selector: pick which configured company to view.
-        company_names = [c.get("name", "Unnamed") for c in self.companies]
-        selector_values = company_names or ["(No companies configured)"]
+        selector_values = company_selector_values(self.companies)
         if self.settings.last_selected_company and self.settings.last_selected_company in selector_values:
             self.company_var.set(self.settings.last_selected_company)
         else:
             self.company_var.set(selector_values[0])
-        self.company_combo = ttk.Combobox(top, textvariable=self.company_var, values=selector_values, state="readonly", width=30)
-        self.company_combo.pack(side="left", padx=8)
-        self.company_combo.bind("<<ComboboxSelected>>", lambda e: self._on_company_selected())
+        self.company_combo = self._add_company_selector(top)
 
         frame, self.overview_tree = self._make_scrollable_tree(
             self.overview_tab, columns=("value",), show="tree headings", height=20
@@ -754,9 +905,11 @@ class MainWindow(tk.Tk):
     def _build_employees_tab(self):
         top = ttk.Frame(self.employees_tab)
         top.pack(fill="x", padx=10, pady=10)
-        ttk.Button(top, text="Refresh", command=self.refresh_from_sheet).pack(side="left")
+        ttk.Button(top, text="Run Employee Efficiency Now", command=self.run_employee_efficiency).pack(side="left")
+        ttk.Button(top, text="Refresh", command=self.refresh_from_sheet).pack(side="left", padx=(6, 0))
         ttk.Button(top, text="Columns...", command=self._choose_employee_columns).pack(side="left", padx=(6, 0))
         ttk.Button(top, text="Configure Positions...", command=self._configure_positions).pack(side="left", padx=(6, 0))
+        self._add_company_selector(top)
 
         ttk.Label(top, text="Filter:").pack(side="left", padx=(16, 4))
         self.employee_filter_var = tk.StringVar(value="")
@@ -766,39 +919,34 @@ class MainWindow(tk.Tk):
 
         legend = ttk.Label(
             self.employees_tab,
-            text="\u26a0 Misplaced = current-position efficiency trails best-fit by "
-                 "\u226515 pts.  \u26a0 Wage Eff. Outlier = paid 50%+ worse than the roster average per effectiveness point.",
+            text="\u26a0 Misplaced = Assigned Position differs from current position.  "
+                 "\u26a0 Wage Eff. Outlier = paid 50%+ worse than the roster average per effectiveness point.  "
+                 "Position locks apply on the next Employee Efficiency run.",
             foreground="#555555",
         )
         legend.pack(fill="x", padx=10)
 
+        saved_columns = {
+            "time_since_last_action" if key == "last_action_ts" else key
+            for key in self.settings.employee_visible_columns
+        }
+        visible_columns = saved_columns or DEFAULT_VISIBLE_EMPLOYEE_COLUMNS
         self.employee_visible_columns = [
-            key for _, key in EMPLOYEE_TABLE_COLUMNS if key in DEFAULT_VISIBLE_EMPLOYEE_COLUMNS
+            key for _, key in EMPLOYEE_TABLE_COLUMNS if key in visible_columns
         ]
-        columns = [key for _, key in EMPLOYEE_TABLE_COLUMNS]
-        frame, self.employees_tree = self._make_scrollable_tree(
-            self.employees_tab, columns=columns, show="headings", height=22
+        frame, self.employees_canvas, self.employees_grid = self._make_scrollable_grid(
+            self.employees_tab
         )
-        self.employees_tree.tag_configure("misplaced", background="#fff3cd")
-        self.employees_tree.tag_configure("wage_outlier", background="#f8d7da")
-        for header, key in EMPLOYEE_TABLE_COLUMNS:
-            self.employees_tree.heading(
-                key, text=header,
-                command=lambda k=key: self._sort_employees(k, False),
-            )
-            anchor = "w" if key in LEFT_ALIGNED_EMPLOYEE_COLUMNS else "center"
-            self.employees_tree.column(key, width=110, anchor=anchor)
-        self.employees_tree["displaycolumns"] = self.employee_visible_columns
         frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self._employee_labels = {key: header for header, key in EMPLOYEE_TABLE_COLUMNS}
+        self._employee_labels[POSITION_LOCK_COLUMN] = "Lock"
         self._employee_records_cache = []
+        self._employee_lock_vars = []
         self._employee_sort_column = None
         self._employee_sort_reverse = False
 
     def _employee_row_values(self, row, columns):
-        values = []
-        for c in columns:
-            values.append(format_field(c, row.get(c, ""), "Employee_Effectiveness"))
-        return values
+        return [format_employee_field(column, row) for column in columns]
 
     def _employee_row_tags(self, row):
         tags = []
@@ -823,44 +971,194 @@ class MainWindow(tk.Tk):
         records = self._employee_records_cache
         if query:
             records = [r for r in records if query in str(r.get("name", "")).lower()]
-        self._render_employee_rows(records)
+        if self._employee_sort_column:
+            self._sort_employees(
+                self._employee_sort_column,
+                self._employee_sort_reverse,
+                toggle=False,
+            )
+        else:
+            self._render_employee_rows(records)
 
     def _render_employee_rows(self, records):
-        self.employees_tree.delete(*self.employees_tree.get_children())
-        columns = [key for _, key in EMPLOYEE_TABLE_COLUMNS]
-        for row in records:
-            self.employees_tree.insert(
-                "", "end",
-                values=self._employee_row_values(row, columns),
-                tags=self._employee_row_tags(row),
-            )
-        self._autosize_columns(self.employees_tree)
+        for widget in self.employees_grid.winfo_children():
+            widget.destroy()
 
-    def _sort_employees(self, col, reverse):
-        reverse = not self._employee_sort_reverse if col == self._employee_sort_column else reverse
+        self._employee_lock_vars = []
+        columns = list(self.employee_visible_columns or ["name"])
+        if "current_position" in columns:
+            columns.insert(columns.index("current_position") + 1, POSITION_LOCK_COLUMN)
+        formatted_rows = [self._employee_row_values(row, columns) for row in records]
+        footer_values = {
+            column: employee_footer_total(records, column)
+            for column in columns
+            if column in EMPLOYEE_FOOTER_TOTAL_COLUMNS
+        }
+        widths = {}
+        for index, column in enumerate(columns):
+            header_width = max(len(line) for line in self._employee_labels[column].split("\n"))
+            value_width = max([0] + [len(str(values[index])) for values in formatted_rows])
+            value_width = max(value_width, len(footer_values.get(column, "")))
+            widths[column] = max(9, min(24, max(header_width, value_width)))
+        if POSITION_LOCK_COLUMN in widths:
+            widths[POSITION_LOCK_COLUMN] = 6
+
+        for column_index, column in enumerate(columns):
+            arrow = ""
+            if column == self._employee_sort_column:
+                arrow = " ▼" if self._employee_sort_reverse else " ▲"
+            tk.Button(
+                self.employees_grid,
+                text=self._employee_labels[column] + arrow,
+                command=lambda col=column: self._sort_employees(col, False),
+                font=("TkDefaultFont", 9, "bold"),
+                background="#d9d9d9",
+                activebackground="#c9c9c9",
+                relief="ridge",
+                borderwidth=1,
+                width=widths[column],
+                padx=4,
+                pady=3,
+            ).grid(row=0, column=column_index, sticky="nsew")
+
+        for row_index, (row, values) in enumerate(zip(records, formatted_rows), start=1):
+            tags = self._employee_row_tags(row)
+            if "wage_outlier" in tags:
+                base_background = "#f8d7da"
+            elif "misplaced" in tags:
+                base_background = "#fff3cd"
+            else:
+                base_background = "#ffffff"
+            for column_index, (column, value) in enumerate(zip(columns, values)):
+                if column == POSITION_LOCK_COLUMN:
+                    background, foreground = employee_cell_style("current_position", row, base_background)
+                    lock_var = tk.BooleanVar(value=self._is_employee_position_locked(row))
+                    self._employee_lock_vars.append(lock_var)
+                    tk.Checkbutton(
+                        self.employees_grid,
+                        variable=lock_var,
+                        command=lambda record=row, var=lock_var: self._set_employee_position_lock(
+                            record, var
+                        ),
+                        background=background,
+                        foreground=foreground,
+                        activebackground=background,
+                        selectcolor="#ffffff",
+                        anchor="center",
+                        relief="ridge",
+                        borderwidth=1,
+                        width=widths[column],
+                        padx=6,
+                        pady=2,
+                    ).grid(row=row_index, column=column_index, sticky="nsew")
+                    continue
+                background, foreground = employee_cell_style(column, row, base_background)
+                anchor = "w" if column in LEFT_ALIGNED_EMPLOYEE_COLUMNS else "center"
+                tk.Label(
+                    self.employees_grid,
+                    text=value,
+                    background=background,
+                    foreground=foreground,
+                    anchor=anchor,
+                    relief="ridge",
+                    borderwidth=1,
+                    width=widths[column],
+                    padx=6,
+                    pady=4,
+                ).grid(row=row_index, column=column_index, sticky="nsew")
+
+        footer_row = len(records) + 1
+        for column_index, column in enumerate(columns):
+            if column in EMPLOYEE_FOOTER_TOTAL_COLUMNS:
+                value = footer_values[column]
+            elif column == "name":
+                value = "Totals"
+            else:
+                value = ""
+            tk.Label(
+                self.employees_grid,
+                text=value,
+                background="#d9e2f3",
+                foreground="#1f1f1f",
+                anchor="w" if column == "name" else "center",
+                font=("TkDefaultFont", 9, "bold"),
+                relief="ridge",
+                borderwidth=1,
+                width=widths[column],
+                padx=6,
+                pady=4,
+            ).grid(row=footer_row, column=column_index, sticky="nsew")
+
+    def _sort_employees(self, col, reverse, toggle=True):
+        if toggle and col == self._employee_sort_column:
+            reverse = not self._employee_sort_reverse
+        elif toggle:
+            reverse = False
         sort_key_field = "last_action_ts" if col == "time_since_last_action" else col
         query = (self.employee_filter_var.get() if hasattr(self, "employee_filter_var") else "").strip().lower()
         records = self._employee_records_cache
         if query:
             records = [r for r in records if query in str(r.get("name", "")).lower()]
-        try:
-            data = sorted(records, key=lambda r: float(r.get(sort_key_field, 0) or 0), reverse=reverse)
-        except (TypeError, ValueError):
-            data = sorted(records, key=lambda r: str(r.get(sort_key_field, "")), reverse=reverse)
-        self._render_employee_rows(data)
+        if col == POSITION_LOCK_COLUMN:
+            data = sorted(records, key=self._is_employee_position_locked, reverse=reverse)
+        else:
+            try:
+                data = sorted(records, key=lambda r: float(r.get(sort_key_field, 0) or 0), reverse=reverse)
+            except (TypeError, ValueError):
+                data = sorted(records, key=lambda r: str(r.get(sort_key_field, "")), reverse=reverse)
         self._employee_sort_column = col
         self._employee_sort_reverse = reverse
-        for header, key in EMPLOYEE_TABLE_COLUMNS:
-            arrow = (" \u25bc" if reverse else " \u25b2") if key == col else ""
-            self.employees_tree.heading(key, text=header + arrow)
+        self._render_employee_rows(data)
+
+    def _locked_employee_ids(self):
+        company = self._active_company()
+        if not company:
+            return set()
+        return {str(employee_id) for employee_id in (company.get("locked_employee_ids") or [])}
+
+    def _is_employee_position_locked(self, row):
+        return employee_position_is_locked(row, self._locked_employee_ids())
+
+    def _set_employee_position_lock(self, row, lock_var):
+        company = self._active_company()
+        employee_id = str(row.get("tId") or "")
+        current_position = str(row.get("current_position") or row.get("position") or "").strip()
+        locked = bool(lock_var.get())
+        if not company or not employee_id or not current_position:
+            lock_var.set(False)
+            return
+
+        previous_locked_ids = self._locked_employee_ids()
+        locked_ids = set(previous_locked_ids)
+        if locked:
+            locked_ids.add(employee_id)
+        else:
+            locked_ids.discard(employee_id)
+        company["locked_employee_ids"] = sorted(locked_ids)
+        try:
+            companies_mod.save_companies(self.companies)
+        except Exception:
+            company["locked_employee_ids"] = sorted(previous_locked_ids)
+            lock_var.set(not locked)
+            messagebox.showerror("Position lock", "The position lock could not be saved.")
+            return
+        if self._employee_sort_column == POSITION_LOCK_COLUMN:
+            self.after_idle(self._apply_employee_filter)
 
     def _choose_employee_columns(self):
         dialog = ColumnPickerDialog(self, self.employee_visible_columns)
         self.wait_window(dialog)
         if dialog.result is not None:
             self.employee_visible_columns = dialog.result
-            self.employees_tree["displaycolumns"] = self.employee_visible_columns or ["name"]
-            self._autosize_columns(self.employees_tree)
+            self._apply_employee_filter()
+            self.settings.employee_visible_columns = list(self.employee_visible_columns)
+            try:
+                self.settings.save()
+            except Exception:
+                messagebox.showerror(
+                    "Column preferences",
+                    "The selected columns were applied but could not be saved.",
+                )
 
     def _configure_positions(self):
         company = self._active_company()
@@ -896,50 +1194,38 @@ class MainWindow(tk.Tk):
             except Exception:
                 messagebox.showerror("Save failed", "Could not save companies to companies.json")
 
-    # ------------------------------------------------- position heatmap --
-    def _build_position_heatmap_tab(self):
-        top = ttk.Frame(self.position_heatmap_tab)
+    # ------------------------------------------------- position position_efficiency --
+    def _build_position_position_efficiency_tab(self):
+        top = ttk.Frame(self.position_position_efficiency_tab)
         top.pack(fill="x", padx=10, pady=10)
         ttk.Button(top, text="Refresh", command=self.refresh_from_sheet).pack(side="left")
-        ttk.Button(top, text="Configure Positions", command=self._configure_heatmap_positions).pack(side="left", padx=(6, 0))
+        ttk.Button(top, text="Configure Positions", command=self._configure_position_efficiency_positions).pack(side="left", padx=(6, 0))
+        self._add_company_selector(top)
         ttk.Label(
             top,
-            text="Tornstats-projected work-stats effectiveness for every employee at every position "
-                 "this company offers. Read straight from Position_Efficiency (Run Employee Efficiency "
-                 "Now to update). Each employee's current position is boxed.",
+            text="Tornstats-projected work-stats effectiveness for every employee and position. "
+                 "Click a column heading to sort. Read straight from Position_Efficiency "
+                 "(Run Employee Efficiency Now to update).",
             foreground="#555555",
             wraplength=460, justify="left",
         ).pack(side="left", padx=10)
 
-        legend = ttk.Frame(self.position_heatmap_tab)
-        legend.pack(fill="x", padx=10)
-        ttk.Label(legend, text="Effectiveness:", foreground="#555555").pack(side="left")
-        for label, sample_value in (("<50", 25), ("50-69", 60), ("70-89", 80), ("90-109", 100), ("110+", 120)):
-            color = _effectiveness_color(sample_value)
-            tk.Label(
-                legend, text=label, background=color, foreground=_readable_text_color(color),
-                width=8, relief="solid", borderwidth=1,
-            ).pack(side="left", padx=(6, 0))
-        tk.Label(legend, text="n/a", background="#e8e8e8", foreground="#777777",
-                 width=8, relief="solid", borderwidth=1).pack(side="left", padx=(6, 0))
-        ttk.Label(legend, text=" = no projection available for that position yet", foreground="#555555").pack(side="left")
+        frame, self.position_efficiency_canvas = self._make_scrollable_canvas(
+            self.position_position_efficiency_tab
+        )
+        frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self._position_efficiency_records_cache = []
+        self._position_efficiency_columns = ()
+        self._position_efficiency_labels = {}
+        self._position_efficiency_sort_column = None
+        self._position_efficiency_sort_reverse = False
 
-        # Header lives inside the SAME scrollable grid as the data rows (row
-        # 0), not a separate frame - two independent grid containers size
-        # their columns independently even with matching column indexes, so
-        # a separate header frame drifts out of alignment with the body as
-        # soon as any column's natural width differs between the two. One
-        # shared grid guarantees the columns actually line up, and scrolls
-        # the header along with the data for free.
-        grid_frame, self.heatmap_canvas, self.heatmap_grid = self._make_scrollable_grid(self.position_heatmap_tab)
-        grid_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-
-    def _configure_heatmap_positions(self):
+    def _configure_position_efficiency_positions(self):
         company = self._active_company()
         if not company:
             messagebox.showinfo("No company selected", "Select or add a company first.")
             return
-        all_positions = sorted(set(getattr(self, "_heatmap_all_positions", []) or []) | set(company.get("last_known_positions") or []))
+        all_positions = sorted(set(getattr(self, "_position_efficiency_all_positions", []) or []) | set(company.get("last_known_positions") or []))
         if not all_positions:
             messagebox.showinfo(
                 "Configure Positions",
@@ -947,12 +1233,12 @@ class MainWindow(tk.Tk):
                 "positions can be read from Tornstats, then Configure Positions to add any it missed.",
             )
             return
-        dialog = PositionVisibilityDialog(self, all_positions, company.get("heatmap_hidden_positions") or [])
+        dialog = PositionVisibilityDialog(self, all_positions, company.get("position_efficiency_hidden_positions") or [])
         self.wait_window(dialog)
         if dialog.result:
             visible = set(dialog.result["visible"])
             company["last_known_positions"] = sorted(set(all_positions) | visible)
-            company["heatmap_hidden_positions"] = sorted(set(all_positions) - visible)
+            company["position_efficiency_hidden_positions"] = sorted(set(all_positions) - visible)
             try:
                 companies_mod.save_companies(self.companies)
             except Exception:
@@ -961,99 +1247,162 @@ class MainWindow(tk.Tk):
             self._populate_position_efficiency()
 
     def _populate_position_efficiency(self):
-        for widget in self.heatmap_grid.winfo_children():
-            widget.destroy()
-
         records = self._safe_read("Position_Efficiency")
+        self._position_efficiency_records_cache = records
         if not records:
-            tk.Label(
-                self.heatmap_grid, text="No data yet - run Employee Efficiency first.",
-                background="#ffffff", padx=10, pady=10,
-            ).grid(row=0, column=0, sticky="w")
-            self._heatmap_all_positions = []
+            self.position_efficiency_canvas.delete("all")
+            self.position_efficiency_canvas.create_text(
+                10,
+                10,
+                text="No data yet - run Employee Efficiency first.",
+                anchor="nw",
+                fill="#000000",
+            )
+            self.position_efficiency_canvas.configure(scrollregion=(0, 0, 320, 40))
+            self._position_efficiency_all_positions = []
             return
 
         meta_cols = {"tId", "name", "current_position"}
-        detected_positions = [k for k in records[0].keys() if k not in meta_cols]
+        detected_positions = [key for key in records[0] if key not in meta_cols]
         company = self._active_company() or {}
-        # Union everything ever seen for this position column - this run's
-        # sheet, plus anything manually added/kept via Configure Positions -
-        # so a position an automatic source drops (e.g. Tornstats never
-        # reporting "Inspector") doesn't just vanish once it's been added by
-        # hand. Filtered by whatever's been unchecked in that same dialog.
         known_positions = sorted(set(detected_positions) | set(company.get("last_known_positions") or []))
-        self._heatmap_all_positions = known_positions
-        hidden = set(company.get("heatmap_hidden_positions") or [])
-        position_names = [p for p in known_positions if p not in hidden]
+        self._position_efficiency_all_positions = known_positions
+        hidden = set(company.get("position_efficiency_hidden_positions") or [])
+        position_names = [position for position in known_positions if position not in hidden]
 
-        rows = sorted(records, key=lambda r: str(r.get("name", "")).lower())
+        self._position_efficiency_columns = (
+            "name", "current_position", "current_efficiency", *position_names
+        )
+        self._position_efficiency_labels = {
+            "name": "Name",
+            "current_position": "Current Position",
+            "current_efficiency": "Current Eff.",
+        }
+        self._sort_position_efficiency(
+            self._position_efficiency_sort_column or "name",
+            self._position_efficiency_sort_reverse,
+            toggle=False,
+        )
 
-        def cell_text_and_color(row, pos):
-            if pos not in row or row.get(pos) in (None, ""):
-                return "n/a", "#e8e8e8", "#777777"
-            try:
-                value = float(row.get(pos))
-            except (TypeError, ValueError):
-                return "n/a", "#e8e8e8", "#777777"
-            color = _effectiveness_color(value)
-            return f"{value:.0f}", color, _readable_text_color(color)
+    def _render_position_efficiency_rows(self, records):
+        canvas = self.position_efficiency_canvas
+        canvas.delete("all")
+        columns = self._position_efficiency_columns
+        labels = self._position_efficiency_labels
+        body_font = tkfont.nametofont("TkDefaultFont")
+        header_font = tkfont.Font(
+            root=self,
+            family=body_font.actual("family"),
+            size=body_font.actual("size"),
+            weight="bold",
+        )
+        widths = {}
+        for column in columns:
+            header_width = header_font.measure(labels.get(column, column)) + 24
+            if column == "name":
+                content_width = max(
+                    [0] + [body_font.measure(str(record.get("name", ""))) for record in records]
+                ) + 20
+                widths[column] = max(100, min(240, max(header_width, content_width)))
+            elif column == "current_position":
+                content_width = max(
+                    [0] + [body_font.measure(str(record.get("current_position") or "")) for record in records]
+                ) + 20
+                widths[column] = max(130, min(240, max(header_width, content_width)))
+            else:
+                widths[column] = max(100, min(190, header_width))
 
-        # Fixed, explicit per-column character widths - shared identically
-        # between the header cell and every data cell in that column - so
-        # columns size deterministically instead of drifting depending on
-        # whether a Label's natural width came from wrapped header text vs.
-        # unwrapped cell text (the previous source of the misalignment).
-        name_width = max([9] + [len(str(r.get("name", ""))) for r in rows]) 
-        position_col_width = max([10] + [len(p) for p in position_names])
-        current_pos_width = max([len("Current Position")] + [len(str(r.get("current_position") or "")) for r in rows])
+        header_height = 34
+        row_height = 32
+        x = 0
+        for column_index, column in enumerate(columns):
+            arrow = ""
+            if column == self._position_efficiency_sort_column:
+                arrow = " ▼" if self._position_efficiency_sort_reverse else " ▲"
+            width = widths[column]
+            tag = f"position_efficiency_header_{column_index}"
+            canvas.create_rectangle(
+                x, 0, x + width, header_height,
+                fill="#d9d9d9", outline="#a0a0a0", width=1, tags=(tag,),
+            )
+            canvas.create_text(
+                x + width / 2,
+                header_height / 2,
+                text=labels.get(column, column) + arrow,
+                font=header_font,
+                fill="#000000",
+                tags=(tag,),
+            )
+            canvas.tag_bind(
+                tag,
+                "<Button-1>",
+                lambda event, col=column: self._sort_position_efficiency(col, False),
+            )
+            x += width
 
-        headers = [("Name", name_width), ("Current Position", current_pos_width), ("Current Eff.", 12)]
-        headers += [(pos, position_col_width) for pos in position_names]
-        for col, (header, width) in enumerate(headers):
-            tk.Label(
-                self.heatmap_grid, text=header, font=("TkDefaultFont", 9, "bold"),
-                background="#e0e0e0", relief="ridge", borderwidth=1,
-                width=width, anchor="center", padx=4, pady=4,
-            ).grid(row=0, column=col, sticky="nsew")
+        for row_index, record in enumerate(records, start=1):
+            current_position = record.get("current_position") or ""
+            x = 0
+            y = header_height + (row_index - 1) * row_height
+            for column in columns:
+                width = widths[column]
+                if column == "current_efficiency":
+                    value = record.get(current_position, "")
+                else:
+                    value = record.get(column, "")
+                if column in {"name", "current_position"}:
+                    text = "" if value in (None, "") else str(value)
+                    background, foreground = "#ffffff", "#000000"
+                    anchor = "w"
+                else:
+                    text, background, foreground = position_efficiency_score_style(value)
+                    anchor = "center"
+                is_current_position = column == current_position
+                border_width = 3 if is_current_position else 1
+                canvas.create_rectangle(
+                    x,
+                    y,
+                    x + width,
+                    y + row_height,
+                    fill=background,
+                    outline="#333333" if is_current_position else "#b0b0b0",
+                    width=border_width,
+                )
+                canvas.create_text(
+                    x + 6 if anchor == "w" else x + width / 2,
+                    y + row_height / 2,
+                    text=text,
+                    fill=foreground,
+                    font=body_font,
+                    anchor="w" if anchor == "w" else "center",
+                )
+                x += width
 
-        for i, r in enumerate(rows, start=1):
-            name = r.get("name", "")
-            current = r.get("current_position") or ""
+        total_width = sum(widths.values())
+        total_height = header_height + len(records) * row_height
+        canvas.configure(scrollregion=(0, 0, total_width, total_height))
 
-            tk.Label(
-                self.heatmap_grid, text=name, anchor="w", padx=6, pady=3, width=name_width,
-                background="#ffffff", relief="ridge", borderwidth=1,
-            ).grid(row=i, column=0, sticky="nsew")
-            tk.Label(
-                self.heatmap_grid, text=current, anchor="w", padx=6, pady=3, width=current_pos_width,
-                background="#ffffff", relief="ridge", borderwidth=1,
-            ).grid(row=i, column=1, sticky="nsew")
+    def _sort_position_efficiency(self, column, reverse, toggle=True):
+        if toggle and column == self._position_efficiency_sort_column:
+            reverse = not self._position_efficiency_sort_reverse
+        elif toggle and column in {"name", "current_position"}:
+            reverse = False
 
-            cur_text, cur_bg, cur_fg = cell_text_and_color(r, current) if current else ("n/a", "#e8e8e8", "#777777")
-            tk.Label(
-                self.heatmap_grid, text=cur_text, anchor="center", padx=6, pady=3, width=12,
-                background=cur_bg, foreground=cur_fg,
-                font=("TkDefaultFont", 9, "bold"), relief="ridge", borderwidth=1,
-            ).grid(row=i, column=2, sticky="nsew")
-
-            for j, pos in enumerate(position_names, start=3):
-                text, bg, fg = cell_text_and_color(r, pos)
-                is_current = pos == current
-                # Boxed (thicker, solid-relief) cell marks the employee's
-                # current position, replacing the old chart's outlined
-                # rectangle - same "you are here" purpose, plain-grid form.
-                tk.Label(
-                    self.heatmap_grid, text=text, anchor="center", padx=6, pady=3, width=position_col_width,
-                    background=bg, foreground=fg,
-                    relief="solid" if is_current else "ridge",
-                    borderwidth=3 if is_current else 1,
-                ).grid(row=i, column=j, sticky="nsew")
+        records = sorted(
+            self._position_efficiency_records_cache,
+            key=lambda record: position_efficiency_sort_value(record, column),
+            reverse=reverse,
+        )
+        self._position_efficiency_sort_column = column
+        self._position_efficiency_sort_reverse = reverse
+        self._render_position_efficiency_rows(records)
 
     # ------------------------------------------------------------ stock --
     def _build_stock_tab(self):
         top = ttk.Frame(self.stock_tab)
         top.pack(fill="x", padx=10, pady=10)
         ttk.Button(top, text="Refresh", command=self.refresh_from_sheet).pack(side="left")
+        self._add_company_selector(top)
 
         paned = ttk.PanedWindow(self.stock_tab, orient="vertical")
         paned.pack(fill="both", expand=True, padx=10, pady=(0, 10))
@@ -1127,6 +1476,7 @@ class MainWindow(tk.Tk):
         self.trend_metric_combo.pack(side="left", padx=6)
         self.trend_metric_combo.bind("<<ComboboxSelected>>", lambda e: self._draw_trend())
         ttk.Button(top, text="Refresh", command=self.refresh_from_sheet).pack(side="left", padx=6)
+        self._add_company_selector(top)
 
         chart_frame = ttk.Frame(self.trends_tab)
         chart_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
@@ -1529,12 +1879,8 @@ class MainWindow(tk.Tk):
             if not silent:
                 self.set_status("Refreshed.")
             # refresh company selector values in case companies.json changed externally
-            company_names = [c.get("name", "Unnamed") for c in self.companies]
-            selector_values = company_names or ["(No companies configured)"]
             try:
-                self.company_combo["values"] = selector_values
-                if self.company_var.get() not in selector_values:
-                    self.company_var.set(selector_values[0])
+                self._update_company_selectors()
             except Exception:
                 pass
         except Exception as e:
@@ -1586,10 +1932,7 @@ class MainWindow(tk.Tk):
             self._companies_listbox.insert(tk.END, c.get("name", "Unnamed"))
         # update selector values as well
         try:
-            vals = [c.get("name", "Unnamed") for c in self.companies] or ["(No companies configured)"]
-            self.company_combo["values"] = vals
-            if self.company_var.get() not in vals:
-                self.company_var.set(vals[0])
+            self._update_company_selectors()
         except Exception:
             pass
 

@@ -19,7 +19,7 @@ auto-created and named after the company on first run) with these tabs:
 | `Director_Efficiency` | Tornstats' own company-wide position-efficiency reference (separate from and not a substitute for per-employee data) | Append, newest first |
 | `Employees` | Current employee roster and Torn's own per-employee effectiveness breakdown | Replace each Snapshot |
 | `Employee_Effectiveness` | Per-employee Tornstats-projected efficiency at every position, best-fit position, capacity/priority-constrained assignment, misplaced-employee flag, and wage efficiency | Replace each Employee Efficiency run |
-| `Position_Efficiency` | The same projections as a wide employee-by-position matrix (source for the GUI's Position Heatmap tab) | Replace each Employee Efficiency run |
+| `Position_Efficiency` | The same projections as a wide employee-by-position matrix (source for the GUI's Position position_efficiency tab) | Replace each Employee Efficiency run |
 | `Employee_Turnover_Log` | Join/leave events, diffed by employee ID against the previous `Employee_Effectiveness` roster | Append, newest first |
 
 A sheet's header row is only ever extended, never reordered or shortened -
@@ -125,6 +125,6 @@ app/efficiency_calc.py  Per-employee position efficiency + capacity/priority-con
 app/profit_calc.py      Derived daily/weekly profit and 7-day rolling averages
 app/sheets_client.py    Google Sheets read/write via per-user OAuth; auto-creates a company's Sheet if needed
 app/collector.py        Snapshot / Employee Efficiency / Run Everything orchestration
-gui/main_window.py      Tkinter GUI - Overview, Employees, Position Heatmap, Stock & Profit, Trends, Settings
+gui/main_window.py      Tkinter GUI - Overview, Employees, Position position_efficiency, Stock & Profit, Trends, Settings
 scripts/                One-off maintenance/migration scripts (not run automatically)
 ```

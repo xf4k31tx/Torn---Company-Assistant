@@ -185,22 +185,14 @@ class TestCollectorEmployeeEfficiency:
     """
     Verify the Collector.run_employee_efficiency() flow.
 
-    Misplaced-employee derivation (mock fixture is deterministic - the
-    Tornstats mock always returns the same flat block regardless of input
-    stats): projected efficiency per position is Director=94.2, Oil
-    Courier=68.5, Accountant=82.1, Trainer=71.3 for every employee, so
-    best_fit is always Director (94.2) for everyone. misplaced_flag fires
-    when (best_fit - current) >= 15:
-      - JohnKnot (Director, 94.2):        diff  0.0 -> not misplaced
-      - OilHand42 (Oil Courier, 68.5):     diff 25.7 -> misplaced
-      - TankFillr (Oil Courier, 68.5):     diff 25.7 -> misplaced
-      - FinanceGuru (Accountant, 82.1):    diff 12.1 -> not misplaced
-      - TrainerX (Trainer, 71.3):          diff 22.9 -> misplaced
-    -> misplaced_count == 3.
+    The fixture has no position capacities, so priority assignment fills
+    every employee into the first alphabetical position, Accountant.
+    Misplaced therefore means current_position != assigned_position:
+    FinanceGuru is correctly placed and the other four are misplaced.
     """
 
-    def test_successful_run(self, all_patched, mock_sheets: MockSheetsClient,
-                             test_settings, test_company):
+    def test_successful_run(self, all_patched, mock_torn: MockTornAPI,
+                             mock_sheets: MockSheetsClient, test_settings, test_company):
         from app.collector import Collector
 
         collector = Collector(test_company, base_settings=test_settings)
@@ -208,15 +200,63 @@ class TestCollectorEmployeeEfficiency:
 
         assert result.ok is True
         assert result.employee_count == 5
-        assert result.misplaced_count == 3
+        assert result.misplaced_count == 4
         assert "Employee_Effectiveness" in mock_sheets._tabs
         assert "Position_Efficiency" in mock_sheets._tabs
         assert len(mock_sheets._tabs["Employee_Effectiveness"]) == 5
 
         director_row = next(r for r in mock_sheets._tabs["Employee_Effectiveness"] if r["name"] == "JohnKnot")
-        assert director_row["misplaced_flag"] == "False"
+        assert director_row["misplaced_flag"] == "True"
+        torn_director = next(
+            employee for employee in mock_torn.get_company_employees()["employees"]
+            if employee["name"] == "JohnKnot"
+        )
+        assert float(director_row["effectiveness_working_stats"]) == pytest.approx(
+            torn_director["effectiveness"]["working_stats"]
+        )
+        assert float(director_row["projected_efficiency_current_position"]) == pytest.approx(94.2)
+
+        position_row = next(
+            r for r in mock_sheets._tabs["Position_Efficiency"] if r["name"] == "JohnKnot"
+        )
+        assert float(position_row["Director"]) == pytest.approx(94.2)
+        assert float(position_row["Director"]) != float(director_row["effectiveness_working_stats"])
+
         courier_row = next(r for r in mock_sheets._tabs["Employee_Effectiveness"] if r["name"] == "OilHand42")
         assert courier_row["misplaced_flag"] == "True"
+
+        accountant_row = next(
+            r for r in mock_sheets._tabs["Employee_Effectiveness"] if r["name"] == "FinanceGuru"
+        )
+        assert accountant_row["assigned_position"] == "Accountant"
+        assert accountant_row["misplaced_flag"] == "False"
+
+    def test_misplaced_uses_assigned_position_not_best_fit(self):
+        from app.collector import is_employee_misplaced
+
+        assert is_employee_misplaced({
+            "current_position": "Oil Courier",
+            "assigned_position": "Oil Courier",
+            "best_fit_position": "Director",
+        }) is False
+        assert is_employee_misplaced({
+            "current_position": "Oil Courier",
+            "assigned_position": "Accountant",
+            "best_fit_position": "Oil Courier",
+        }) is True
+        assert is_employee_misplaced({
+            "current_position": "Oil Courier",
+            "assigned_position": "",
+            "best_fit_position": "Director",
+        }) is False
+
+    def test_employee_table_defaults_use_torn_current_position_effectiveness(self):
+        from gui.main_window import EMPLOYEE_TABLE_COLUMNS, DEFAULT_VISIBLE_EMPLOYEE_COLUMNS
+
+        labels = {key: label for label, key in EMPLOYEE_TABLE_COLUMNS}
+        assert labels["effectiveness_working_stats"] == "Current Pos.\nEff."
+        assert "effectiveness_working_stats" in DEFAULT_VISIBLE_EMPLOYEE_COLUMNS
+        assert "projected_efficiency_current_position" not in DEFAULT_VISIBLE_EMPLOYEE_COLUMNS
 
     def test_missing_tornstats_key_returns_error(self, patch_torn, test_settings):
         from app.collector import Collector
@@ -322,6 +362,35 @@ class TestCollectorEmployeeEfficiency:
         # the assertion that matters here is that assignment actually ran
         # (every row has SOME assigned_position, not blank).
         assert all(v != "" for v in assigned.values())
+
+    def test_locked_employee_uses_current_position_with_tornstats_efficiency(
+        self, all_patched, mock_sheets: MockSheetsClient, test_settings, test_company
+    ):
+        from app.collector import Collector
+
+        test_company["position_capacities"] = {
+            "Director": 1,
+            "Oil Courier": 2,
+            "Accountant": 1,
+            "Trainer": 1,
+        }
+        test_company["position_priority_order"] = [
+            "Director", "Accountant", "Oil Courier", "Trainer"
+        ]
+        test_company["locked_employee_ids"] = ["220002"]
+
+        result = Collector(test_company, base_settings=test_settings).run_employee_efficiency()
+
+        assert result.ok is True
+        locked_row = next(
+            row for row in mock_sheets._tabs["Employee_Effectiveness"]
+            if row["tId"] == "220002"
+        )
+        assert locked_row["assigned_position"] == locked_row["current_position"] == "Oil Courier"
+        assert float(locked_row["assigned_efficiency"]) == float(
+            locked_row["projected_efficiency_current_position"]
+        )
+        assert locked_row["misplaced_flag"] == "False"
 
 
 class TestCollectorEverything:

@@ -301,7 +301,8 @@ def compute_employee_rows(
 def assign_positions(rows: List[dict], position_names: List[str],
                       position_capacities: Dict[str, int],
                       total_capacity: Optional[int] = None,
-                      priority_order: Optional[List[str]] = None) -> None:
+                      priority_order: Optional[List[str]] = None,
+                      locked_employee_ids: Optional[Set[str]] = None) -> List[str]:
     """
     Fills positions in priority order - this is "Optimal Position
     (Priority)". priority_order lists positions top-to-bottom, highest
@@ -323,13 +324,40 @@ def assign_positions(rows: List[dict], position_names: List[str],
     staffing your most important seats first. Mutates `rows` in place,
     setting "assigned_position" / "assigned_efficiency" on every row ("" if
     the employee couldn't be placed - out of capacity, or no projection
-    data for them at all).
+    data for them at all). Employees in locked_employee_ids are assigned to
+    their current Torn position first and consume capacity before the normal
+    fill. Returns warnings when hard locks exceed configured capacities.
     """
     ordered_positions = [p for p in (priority_order or []) if p in position_names]
     ordered_positions += [p for p in position_names if p not in ordered_positions]
 
+    locked_ids = {str(employee_id) for employee_id in (locked_employee_ids or set())}
+    warnings = []
     assigned_employee = [False] * len(rows)
+    filled_by_position: Dict[str, int] = {}
     total_assigned = 0
+
+    for idx, row in enumerate(rows):
+        employee_id = str(row.get("tId") or "")
+        current_position = str(row.get("current_position") or "").strip()
+        if employee_id not in locked_ids or not current_position:
+            continue
+        row["assigned_position"] = current_position
+        row["assigned_efficiency"] = (row.get("projected") or {}).get(current_position, "")
+        assigned_employee[idx] = True
+        filled_by_position[current_position] = filled_by_position.get(current_position, 0) + 1
+        total_assigned += 1
+
+    for position, locked_count in sorted(filled_by_position.items()):
+        cap = position_capacities.get(position)
+        if cap is not None and locked_count > cap:
+            warnings.append(
+                f"{locked_count} locked employees exceed the {position} capacity of {cap}."
+            )
+    if total_capacity is not None and total_assigned > total_capacity:
+        warnings.append(
+            f"{total_assigned} locked employees exceed the company capacity of {total_capacity}."
+        )
 
     for pos in ordered_positions:
         if total_capacity is not None and total_assigned >= total_capacity:
@@ -345,7 +373,7 @@ def assign_positions(rows: List[dict], position_names: List[str],
                 candidates.append((proj[pos], idx))
         candidates.sort(key=lambda c: c[0], reverse=True)
 
-        filled_for_pos = 0
+        filled_for_pos = filled_by_position.get(pos, 0)
         for eff, idx in candidates:
             if cap is not None and filled_for_pos >= cap:
                 break
@@ -360,6 +388,7 @@ def assign_positions(rows: List[dict], position_names: List[str],
     for row in rows:
         row.setdefault("assigned_position", "")
         row.setdefault("assigned_efficiency", "")
+    return warnings
 
 
 def build_position_efficiency_rows(rows: List[dict], position_names: List[str]) -> Tuple[List[str], List[list]]:

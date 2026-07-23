@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from dotenv import dotenv_values
@@ -23,6 +23,7 @@ class Settings:
     google_sheet_name: str = ""
     snapshot_interval_minutes: int = 30
     last_selected_company: str = ""
+    employee_visible_columns: list[str] = field(default_factory=list)
 
     @classmethod
     def load(cls) -> "Settings":
@@ -47,6 +48,10 @@ class Settings:
             allowed["snapshot_interval_minutes"] = int(allowed.get("snapshot_interval_minutes", 30) or 0)
         except (TypeError, ValueError):
             allowed["snapshot_interval_minutes"] = 0
+        columns = allowed.get("employee_visible_columns", [])
+        allowed["employee_visible_columns"] = (
+            [str(column) for column in columns] if isinstance(columns, list) else []
+        )
         return cls(**allowed)
 
     def save(self) -> None:
