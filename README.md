@@ -141,29 +141,32 @@ not reordered or shortened.
    pip install -r requirements.txt
    ```
 
-3. In Google Cloud Console, enable the Google Sheets API and Google Drive API.
-4. Create an OAuth client with application type **Desktop app**, then download
-   its JSON configuration. This identifies the desktop application; it is not
-   a service-account private key.
+3. In Google Cloud Console, enable the Google Sheets API, Google Drive API, and Google Picker API.
+4. Create an OAuth client with application type **Desktop app**, then place its
+   downloaded JSON configuration in the project root. The ignored
+   `client_secret_*.json` file is auto-discovered for development and embedded
+   under a neutral internal resource name in production builds; never commit it.
 5. Start TCA:
 
    ```powershell
    python main.py
    ```
 
-6. In **Settings**, choose the OAuth desktop-client JSON, select
-   **Save Securely**, and then select **Sign in with Google**.
+6. In **Settings**, select **Sign in with Google**. Production users are not
+   prompted for an OAuth configuration file or shown its filename.
 7. In **Settings > Companies**, add each company:
 
    - **Torn API key** — required limited-access company key.
    - **Torn Public API key** — optional key used for Company Health Score
      comparisons; the limited-access key is used as fallback.
    - **Tornstats API key** — required only for Employee Efficiency operations.
-   - **Google Sheet ID** — optional existing Sheet ID. Leave blank to create a
-     Sheet automatically.
+   - **Google Sheet** — after a company is added, Google Picker opens so you can
+     explicitly select that company's existing Sheet. If selection is canceled,
+     leave the assignment blank and TCA creates a new Sheet on the first run.
 
-When using an existing Sheet, grant Editor access to every Google account that
-will use it.
+The OAuth flow requests only `drive.file`; TCA can access Sheets it creates or
+that the user explicitly selects with Google Picker. When sharing an existing
+Sheet, grant Editor access to every Google account that will use it.
 
 ## Security and local data
 
@@ -237,11 +240,26 @@ specification:
 python -m PyInstaller --noconfirm --clean "Knotty Oil Tracker.spec"
 ```
 
-The specification collects both Matplotlib and the lazily imported
-`google_auth_oauthlib` package. The generated executable is unsigned and may
-trigger Microsoft Defender SmartScreen. Test-launch every new build and verify
-Google sign-in, secure storage, and external configuration before distributing
-it.
+The specification collects Matplotlib and the lazily imported
+`google_auth_oauthlib` package. It also validates the ignored local OAuth
+configuration, stages it under a neutral resource name, and embeds it in the
+one-file executable without exposing the downloaded filename. The generated
+executable is unsigned and may trigger Microsoft Defender SmartScreen.
+Test-launch every new build and verify Google sign-in, secure storage, and
+external configuration before distributing it.
+
+Build the separate file-integrity verifier and generate the main executable's
+release checksum:
+
+```powershell
+python -m PyInstaller --noconfirm --clean "TCA Checksum Verifier.spec"
+python scripts/generate_release_checksum.py "dist\Knotty Oil Tracker.exe"
+```
+
+Distribute `TCA Checksum Verifier.exe` and
+`Knotty Oil Tracker.exe.sha256` alongside the application. Publish the same
+SHA-256 value on the official TCA website or release page so users can compare
+against a source independent of the downloaded executable.
 
 ## Legal documents
 
@@ -270,4 +288,5 @@ scripts/                Manual maintenance and migration scripts
 tests/                  Pytest suite and mock endpoint data
 legal/                  Draft Terms of Service and Privacy Policy
 Knotty Oil Tracker.spec PyInstaller build specification
+TCA Checksum Verifier.spec Integrity-verifier build specification
 ```

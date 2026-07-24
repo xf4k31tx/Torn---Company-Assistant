@@ -18,7 +18,6 @@ LEGACY_ENV_PATH = PROJECT_ROOT / ".env"
 class Settings:
     torn_api_key: str = ""
     tornstats_api_key: str = ""
-    google_oauth_client_file: str = ""
     google_sheet_id: str = ""
     google_sheet_name: str = ""
     snapshot_interval_minutes: int = 30

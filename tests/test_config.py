@@ -21,3 +21,19 @@ def test_invalid_employee_column_preferences_fall_back_to_empty(monkeypatch):
     )
 
     assert Settings.load().employee_visible_columns == []
+
+
+def test_legacy_oauth_file_path_is_removed_on_save(monkeypatch):
+    stored = {
+        "settings": {
+            "google_oauth_client_file": "C:/private/client.json",
+            "snapshot_interval_minutes": 30,
+        }
+    }
+    monkeypatch.setattr("app.config.secure_storage.get", lambda key, default: stored.get(key, default))
+    monkeypatch.setattr("app.config.secure_storage.set", lambda key, value: stored.__setitem__(key, value))
+
+    settings = Settings.load()
+    settings.save()
+
+    assert "google_oauth_client_file" not in stored["settings"]

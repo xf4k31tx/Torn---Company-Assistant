@@ -1,7 +1,25 @@
 # -*- mode: python ; coding: utf-8 -*-
+import atexit
+import json
+import shutil
+import tempfile
+from pathlib import Path
+
 from PyInstaller.utils.hooks import collect_all
 
-datas = []
+project_root = Path(SPECPATH)
+oauth_sources = sorted(project_root.glob('client_secret_*.json'))
+if len(oauth_sources) != 1:
+    raise SystemExit('Production build requires exactly one local OAuth desktop-client configuration.')
+oauth_config = json.loads(oauth_sources[0].read_text(encoding='utf-8'))
+if not oauth_config.get('installed', {}).get('client_id') or not oauth_config['installed'].get('client_secret'):
+    raise SystemExit('The local OAuth desktop-client configuration is invalid.')
+oauth_stage_dir = Path(tempfile.mkdtemp(prefix='tca-oauth-'))
+oauth_resource = oauth_stage_dir / '_tca_oauth.dat'
+shutil.copyfile(oauth_sources[0], oauth_resource)
+atexit.register(shutil.rmtree, oauth_stage_dir, ignore_errors=True)
+
+datas = [(str(oauth_resource), '.')]
 binaries = []
 hiddenimports = []
 tmp_ret = collect_all('matplotlib')
@@ -44,4 +62,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=str(project_root / 'TCA-v3.ico'),
 )

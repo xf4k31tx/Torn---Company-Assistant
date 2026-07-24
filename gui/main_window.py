@@ -17,10 +17,12 @@ background thread so the UI never freezes on network calls.
 from __future__ import annotations
 
 import datetime
+import json
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog, simpledialog
+from pathlib import Path
+from tkinter import ttk, messagebox, simpledialog
 from tkinter import font as tkfont
 
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -30,11 +32,25 @@ from matplotlib.ticker import FuncFormatter
 from app.collector import Collector
 from app.config import Settings
 from app.sheets_client import SheetsClient
-from app.google_auth import authorize as authorize_google
+from app.google_auth import authorize as authorize_google, pick_google_sheet
 from app import companies as companies_mod
+
+# Stores only window size, position, and maximized state.
+# API keys and other sensitive settings remain in the encrypted Settings file.
+WINDOW_STATE_FILE = Path.home() / ".torn_company_assistant_window.json"
 
 # Fields that represent Torn dollars and should render as "$1,234,567" rather
 # than a bare number. Keyed by the sheet-tab they come from.
+INTEGER_FIELDS = {
+    "Stock_History": {"in_stock", "sold_amount", "created"},
+}
+def format_int(value) -> str:
+    """1234 / 1234.0 -> '1,234'."""
+    try:
+        return f"{int(round(float(value))):,}"
+    except (TypeError, ValueError):
+        return str(value)
+    
 MONEY_FIELDS = {
     "Company_History": {
         "daily_income", "daily_profit", "weekly_income", "weekly_profit", "company_funds",
@@ -150,6 +166,8 @@ def format_field(field_name: str, value, tab: str) -> str:
         return format_signed_int(value)
     if field_name in BOOL_FIELDS.get(tab, ()):
         return format_bool_flag(value)
+    if field_name in INTEGER_FIELDS.get(tab, ()):
+        return format_int(value)
     return str(value)
 
 
@@ -158,7 +176,7 @@ def format_employee_field(field_name: str, row: dict) -> str:
         return format_time_since(row.get("last_action_ts"))
     value = row.get(field_name, "")
     formatted = format_field(field_name, value, "Employee_Effectiveness")
-    if field_name in {"effectiveness_addiction", "effectiveness_inactivity"}:
+    if field_name in {"effectiveness_addiction", "effectiveness_inactivity", "effectiveness_director_education", "effectiveness_book", "effectiveness_management", "effectiveness_settled_in", "effectiveness_working_stats", "effectiveness_total", "effectiveness_merits"}:
         try:
             if float(value) <= -10:
                 return f"\u26a0 {formatted}"
@@ -171,8 +189,13 @@ EMPLOYEE_FOOTER_TOTAL_COLUMNS = {
     "wage",
     "effectiveness_total",
     "effectiveness_working_stats",
+    "effectiveness_settled_in",
+    "effectiveness_director_education",
     "effectiveness_addiction",
     "effectiveness_inactivity",
+    "effectiveness_management",
+    "effectiveness_book",
+    "effectiveness_merits",
     "assigned_efficiency",
 }
 
@@ -212,7 +235,7 @@ def employee_cell_style(field_name: str, row: dict, base_background="#ffffff"):
             if current_position == assigned_position:
                 return "#d4edda", "#155724"
             return "#f8d7da", "#721c24"
-    if field_name in {"effectiveness_addiction", "effectiveness_inactivity"}:
+    if field_name in {"effectiveness_addiction", "effectiveness_inactivity", "effectiveness_director_education", "effectiveness_book", "effectiveness_management", "effectiveness_settled_in", "effectiveness_working_stats", "effectiveness_total", "effectiveness_merits"}:
         try:
             if float(row.get(field_name)) <= -10:
                 return "#f8d7da", "#721c24"
@@ -233,9 +256,9 @@ def position_efficiency_score_style(value):
         background = "#c62828"
     elif rounded_score < 75:
         background = "#ef6c00"
-    elif rounded_score < 100:
+    elif rounded_score < 99:
         background = "#f9c74f"
-    elif rounded_score < 125:
+    elif rounded_score < 129:
         background = "#66bb6a"
     else:
         background = "#1b5e20"
@@ -323,16 +346,16 @@ EMPLOYEE_TABLE_COLUMNS = [
     ("Manual\nLabor", "manual_labor"),
     ("Intelligence", "intelligence"),
     ("Endurance", "endurance"),
-    ("Total Eff.", "effectiveness_total"),
-    ("Current Pos.\nEff.", "effectiveness_working_stats"),
+    ("Total\nEff.", "effectiveness_total"),
+    ("Work Stats\nEff.", "effectiveness_working_stats"),
     ("Settled In\nEff.", "effectiveness_settled_in"),
     ("Education\nEff.", "effectiveness_director_education"),
     ("Addiction\nEff.", "effectiveness_addiction"),
     ("Inactivity\nEff.", "effectiveness_inactivity"),
     ("Management\nEff.", "effectiveness_management"),
-    ("Book Eff.", "effectiveness_book"),
-    ("Merits Eff.", "effectiveness_merits"),
-    ("Current Pos.\nProjected Eff.", "projected_efficiency_current_position"),
+    ("Book\nEff.", "effectiveness_book"),
+    ("Merits\nEff.", "effectiveness_merits"),
+    ("Current\nEff.", "projected_efficiency_current_position"),
     ("Best Fit\nPosition", "best_fit_position"),
     ("Best Fit\nEff.", "best_fit_efficiency"),
     ("Assigned\nPosition", "assigned_position"),
@@ -349,9 +372,10 @@ EMPLOYEE_TABLE_COLUMNS = [
 # plus the new Phase 4 misplaced/wage-outlier flags, without overwhelming
 # a first-time user with all 26 columns at once.
 DEFAULT_VISIBLE_EMPLOYEE_COLUMNS = {
-    "name", "current_position", "wage", "effectiveness_total",
-    "effectiveness_working_stats", "best_fit_position", "best_fit_efficiency",
-    "assigned_position", "assigned_efficiency", "misplaced_flag", "wage_efficiency_flag",
+    "tId", "name", "wage", "current_position", "projected_efficiency_current_position",
+    "assigned_position", "assigned_efficiency", "effectiveness_settled_in", "effectiveness_education",
+    "effectiveness_addiction", "effectiveness_inactivity", "effectiveness_management", 
+    "effectiveness_book", "effectiveness_merits", "effectiveness_total", "time_since_last_action", 
 }
 
 LEFT_ALIGNED_EMPLOYEE_COLUMNS = {"name", "current_position", "best_fit_position", "assigned_position"}
@@ -365,41 +389,203 @@ def employee_position_is_locked(row, locked_employee_ids):
 
 
 class ColumnPickerDialog(tk.Toplevel):
-    """Modal checklist for which Employees columns are visible. self.result
-    ends up as the list of selected row-keys (in EMPLOYEE_TABLE_COLUMNS
-    order), or None if cancelled."""
+    """
+    Modal dialog for choosing which Employees columns are visible and
+    arranging their display order.
+
+    self.result is the ordered list of selected column keys, or None when
+    cancelled.
+    """
 
     def __init__(self, master, visible_keys):
         super().__init__(master)
-        self.title("Choose Columns")
+        self.title("Choose and Reorder Columns")
         self.resizable(False, False)
         self.result = None
         self.transient(master)
         self.grab_set()
 
-        self.vars = {key: tk.BooleanVar(value=key in visible_keys) for _, key in EMPLOYEE_TABLE_COLUMNS}
+        self.column_labels = {
+            key: header.replace("\n", " ")
+            for header, key in EMPLOYEE_TABLE_COLUMNS
+        }
 
-        canvas_frame = ttk.Frame(self)
-        canvas_frame.pack(fill="both", expand=True, padx=12, pady=12)
-        cols = 2
-        for i, (header, key) in enumerate(EMPLOYEE_TABLE_COLUMNS):
-            label = header.replace("\n", " ")
-            ttk.Checkbutton(canvas_frame, text=label, variable=self.vars[key]).grid(
-                row=i // cols, column=i % cols, sticky="w", padx=6, pady=2
+        all_keys = [key for _, key in EMPLOYEE_TABLE_COLUMNS]
+
+        # Keep the currently saved/displayed order first.
+        self.column_order = [
+            key for key in visible_keys
+            if key in self.column_labels
+        ]
+
+        # Add currently hidden columns after the visible columns.
+        self.column_order.extend(
+            key for key in all_keys
+            if key not in self.column_order
+        )
+
+        self.visible_keys = set(visible_keys)
+
+        ttk.Label(
+            self,
+            text=(
+                "Select the columns to display. Use Move Up and Move Down\n"
+                "to change their left-to-right order."
+            ),
+            justify="left",
+        ).pack(anchor="w", padx=12, pady=(12, 8))
+
+        content = ttk.Frame(self)
+        content.pack(fill="both", expand=True, padx=12)
+
+        self.column_list = tk.Listbox(
+            content,
+            width=38,
+            height=min(22, len(self.column_order)),
+            selectmode="browse",
+            exportselection=False,
+        )
+        self.column_list.grid(row=0, column=0, rowspan=6, sticky="nsew")
+
+        scrollbar = ttk.Scrollbar(
+            content,
+            orient="vertical",
+            command=self.column_list.yview,
+        )
+        scrollbar.grid(row=0, column=1, rowspan=6, sticky="ns")
+        self.column_list.configure(yscrollcommand=scrollbar.set)
+
+        ttk.Button(
+            content,
+            text="Show / Hide",
+            command=self._toggle_selected,
+            width=14,
+        ).grid(row=0, column=2, padx=(10, 0), pady=(0, 4), sticky="ew")
+
+        ttk.Button(
+            content,
+            text="Move Up",
+            command=lambda: self._move_selected(-1),
+            width=14,
+        ).grid(row=1, column=2, padx=(10, 0), pady=4, sticky="ew")
+
+        ttk.Button(
+            content,
+            text="Move Down",
+            command=lambda: self._move_selected(1),
+            width=14,
+        ).grid(row=2, column=2, padx=(10, 0), pady=4, sticky="ew")
+
+        ttk.Button(
+            content,
+            text="Show All",
+            command=self._show_all,
+            width=14,
+        ).grid(row=3, column=2, padx=(10, 0), pady=4, sticky="ew")
+
+        ttk.Button(
+            content,
+            text="Hide All",
+            command=self._hide_all,
+            width=14,
+        ).grid(row=4, column=2, padx=(10, 0), pady=4, sticky="ew")
+
+        content.rowconfigure(5, weight=1)
+        content.columnconfigure(0, weight=1)
+
+        self.column_list.bind(
+            "<Double-Button-1>",
+            lambda event: self._toggle_selected(),
+        )
+
+        self._refresh_list()
+
+        button_row = ttk.Frame(self)
+        button_row.pack(pady=12)
+
+        ttk.Button(
+            button_row,
+            text="Apply",
+            command=self._apply,
+        ).pack(side="left", padx=4)
+
+        ttk.Button(
+            button_row,
+            text="Cancel",
+            command=self.destroy,
+        ).pack(side="left", padx=4)
+
+    def _refresh_list(self, selected_index=None):
+        self.column_list.delete(0, "end")
+
+        for key in self.column_order:
+            marker = "☑" if key in self.visible_keys else "☐"
+            self.column_list.insert(
+                "end",
+                f"{marker}  {self.column_labels[key]}",
             )
 
-        btn_row = ttk.Frame(self)
-        btn_row.pack(pady=(0, 12))
-        ttk.Button(btn_row, text="Show All", command=self._show_all).pack(side="left", padx=4)
-        ttk.Button(btn_row, text="Apply", command=self._apply).pack(side="left", padx=4)
-        ttk.Button(btn_row, text="Cancel", command=self.destroy).pack(side="left", padx=4)
+        if selected_index is not None and self.column_order:
+            selected_index = max(
+                0,
+                min(selected_index, len(self.column_order) - 1),
+            )
+            self.column_list.selection_clear(0, "end")
+            self.column_list.selection_set(selected_index)
+            self.column_list.activate(selected_index)
+            self.column_list.see(selected_index)
+
+    def _selected_index(self):
+        selection = self.column_list.curselection()
+        if not selection:
+            return None
+        return selection[0]
+
+    def _toggle_selected(self):
+        index = self._selected_index()
+        if index is None:
+            return
+
+        key = self.column_order[index]
+
+        if key in self.visible_keys:
+            self.visible_keys.remove(key)
+        else:
+            self.visible_keys.add(key)
+
+        self._refresh_list(index)
+
+    def _move_selected(self, direction):
+        index = self._selected_index()
+        if index is None:
+            return
+
+        target = index + direction
+
+        if not 0 <= target < len(self.column_order):
+            return
+
+        self.column_order[index], self.column_order[target] = (
+            self.column_order[target],
+            self.column_order[index],
+        )
+
+        self._refresh_list(target)
 
     def _show_all(self):
-        for var in self.vars.values():
-            var.set(True)
+        self.visible_keys = set(self.column_order)
+        self._refresh_list(self._selected_index())
+
+    def _hide_all(self):
+        self.visible_keys.clear()
+        self._refresh_list(self._selected_index())
 
     def _apply(self):
-        self.result = [key for _, key in EMPLOYEE_TABLE_COLUMNS if self.vars[key].get()]
+        self.result = [
+            key
+            for key in self.column_order
+            if key in self.visible_keys
+        ]
         self.destroy()
 
 
@@ -619,7 +805,15 @@ class MainWindow(tk.Tk):
 
         self._build_menu()
         self._build_layout()
-        self._auto_size_window()
+
+        # Track the most recent non-maximized geometry so it can be restored
+        # even when the application is closed while maximized.
+        self._last_normal_geometry = None
+
+        self._restore_window_state()
+        self.bind("<Configure>", self._remember_normal_geometry, add="+")
+        self.protocol("WM_DELETE_WINDOW", self._on_window_close)
+
         self._refresh_all(silent=True)
 
     def _migrate_legacy_primary_company(self):
@@ -653,21 +847,159 @@ class MainWindow(tk.Tk):
             "further companies there the same way.",
         )
 
-    def _auto_size_window(self):
-        """Start at a size proportional to the actual screen instead of a
-        fixed 1100x700 that clips content on smaller displays or wastes
-        space on larger ones. Window stays freely resizable after this;
-        per-tab tables also get scrollbars and auto-fit columns so content
-        stays reachable even if the window itself is later shrunk."""
+    def _restore_window_state(self):
+        """
+        Restore the previous window size, position, and maximized state.
+
+        On the first run, or if the saved state cannot be read, the window
+        opens maximized. This is normal Windows maximization rather than
+        borderless fullscreen, so the user can still restore and resize it.
+        """
         self.update_idletasks()
-        screen_w = self.winfo_screenwidth()
-        screen_h = self.winfo_screenheight()
-        win_w = max(900, min(1500, int(screen_w * 0.85)))
-        win_h = max(600, min(950, int(screen_h * 0.85)))
-        x = (screen_w - win_w) // 2
-        y = (screen_h - win_h) // 2
-        self.geometry(f"{win_w}x{win_h}+{x}+{y}")
         self.minsize(900, 600)
+
+        try:
+            with WINDOW_STATE_FILE.open("r", encoding="utf-8") as file:
+                saved_state = json.load(file)
+        except (OSError, ValueError, TypeError):
+            saved_state = None
+
+        if not isinstance(saved_state, dict):
+            # First application run.
+            self.after_idle(lambda: self.state("zoomed"))
+            return
+
+        geometry = saved_state.get("geometry")
+        if self._valid_window_geometry(geometry):
+            self.geometry(geometry)
+            self._last_normal_geometry = geometry
+        else:
+            self._set_default_window_geometry()
+
+        if saved_state.get("maximized", False):
+            self.after_idle(lambda: self.state("zoomed"))
+
+
+    def _set_default_window_geometry(self):
+        """
+        Set a safe fallback normal-window geometry.
+
+        This is mainly used if the saved state file exists but contains invalid
+        geometry. A true first run is opened maximized by _restore_window_state().
+        """
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+
+        window_width = max(900, min(1500, int(screen_width * 0.85)))
+        window_height = max(600, min(950, int(screen_height * 0.85)))
+
+        x = max(0, (screen_width - window_width) // 2)
+        y = max(0, (screen_height - window_height) // 2)
+
+        geometry = f"{window_width}x{window_height}+{x}+{y}"
+        self.geometry(geometry)
+        self._last_normal_geometry = geometry
+
+
+    def _valid_window_geometry(self, geometry):
+        """
+        Check that a saved Tk geometry string is usable and that at least part
+        of the window remains visible on the current monitor arrangement.
+        """
+        if not isinstance(geometry, str):
+            return False
+
+        try:
+            size, x_text, y_text = geometry.replace("-", "+-").split("+", 2)
+            width_text, height_text = size.split("x", 1)
+
+            width = int(width_text)
+            height = int(height_text)
+            x = int(x_text)
+            y = int(y_text)
+        except (TypeError, ValueError):
+            return False
+
+        if width < 900 or height < 600:
+            return False
+
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+
+        # Keep at least 100 pixels accessible on the current display.
+        if x > screen_width - 100:
+            return False
+        if y > screen_height - 100:
+            return False
+        if x + width < 100:
+            return False
+        if y + height < 100:
+            return False
+
+        return True
+
+
+    def _remember_normal_geometry(self, event=None):
+        """
+        Remember size and position changes only while the window is in its
+        normal, resizable state.
+
+        Windows reports the maximized dimensions through geometry(), so ignoring
+        Configure events while maximized preserves the user's last normal size.
+        """
+        if event is not None and event.widget is not self:
+            return
+
+        try:
+            if self.state() == "normal":
+                geometry = self.geometry()
+                if self._valid_window_geometry(geometry):
+                    self._last_normal_geometry = geometry
+        except tk.TclError:
+            pass
+
+
+    def _save_window_state(self):
+        """Save the current normal geometry and whether the window is maximized."""
+        try:
+            current_state = self.state()
+        except tk.TclError:
+            current_state = "normal"
+
+        maximized = current_state == "zoomed"
+
+        if current_state == "normal":
+            geometry = self.geometry()
+            if self._valid_window_geometry(geometry):
+                self._last_normal_geometry = geometry
+
+        geometry = self._last_normal_geometry
+
+        if not self._valid_window_geometry(geometry):
+            geometry = None
+
+        state_data = {
+            "geometry": geometry,
+            "maximized": maximized,
+        }
+
+        try:
+            WINDOW_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+            temporary_file = WINDOW_STATE_FILE.with_suffix(".tmp")
+            with temporary_file.open("w", encoding="utf-8") as file:
+                json.dump(state_data, file, indent=2)
+
+            temporary_file.replace(WINDOW_STATE_FILE)
+        except OSError:
+            # Window persistence is convenient but should never prevent closing.
+            pass
+
+
+    def _on_window_close(self):
+        """Save the window state and then close the application."""
+        self._save_window_state()
+        self.destroy()
 
     # --------------------------------------------------------- tree utils --
     def _make_scrollable_tree(self, parent, columns, show="headings", height=15):
@@ -905,8 +1237,8 @@ class MainWindow(tk.Tk):
     def _build_employees_tab(self):
         top = ttk.Frame(self.employees_tab)
         top.pack(fill="x", padx=10, pady=10)
-        ttk.Button(top, text="Run Employee Efficiency Now", command=self.run_employee_efficiency).pack(side="left")
-        ttk.Button(top, text="Refresh", command=self.refresh_from_sheet).pack(side="left", padx=(6, 0))
+        ttk.Button(top, text="Update Employee Efficiency", command=self.run_employee_efficiency).pack(side="left")
+        ttk.Button(top, text="Refresh from Sheet", command=self.refresh_from_sheet).pack(side="left", padx=(6, 0))
         ttk.Button(top, text="Columns...", command=self._choose_employee_columns).pack(side="left", padx=(6, 0))
         ttk.Button(top, text="Configure Positions...", command=self._configure_positions).pack(side="left", padx=(6, 0))
         self._add_company_selector(top)
@@ -919,21 +1251,39 @@ class MainWindow(tk.Tk):
 
         legend = ttk.Label(
             self.employees_tab,
-            text="\u26a0 Misplaced = Assigned Position differs from current position.  "
-                 "\u26a0 Wage Eff. Outlier = paid 50%+ worse than the roster average per effectiveness point.  "
-                 "Position locks apply on the next Employee Efficiency run.",
+            text="Current Effectiveness is from Torn API, every other eff. column is originated from Tornstats Calculations.  "
+                 "Position locks apply on the next Employee Efficiency run.  "
+                 "\n\u26a0 Misplaced = Assigned Position differs from current position.  "
+                 "\u26a0 Wage Eff. Outlier = paid 50%+ worse than the roster average per effectiveness point.  ",
             foreground="#555555",
         )
         legend.pack(fill="x", padx=10)
 
-        saved_columns = {
+        saved_columns = [
             "time_since_last_action" if key == "last_action_ts" else key
             for key in self.settings.employee_visible_columns
-        }
-        visible_columns = saved_columns or DEFAULT_VISIBLE_EMPLOYEE_COLUMNS
-        self.employee_visible_columns = [
-            key for _, key in EMPLOYEE_TABLE_COLUMNS if key in visible_columns
         ]
+
+        valid_column_keys = {
+            key for _, key in EMPLOYEE_TABLE_COLUMNS
+        }
+
+        saved_columns = [
+            key for key in saved_columns
+            if key in valid_column_keys
+        ]
+
+        if saved_columns:
+            # Preserve the exact saved left-to-right order.
+            self.employee_visible_columns = saved_columns
+        else:
+            # On first use, follow EMPLOYEE_TABLE_COLUMNS order while selecting
+            # only the default visible columns.
+            self.employee_visible_columns = [
+                key
+                for _, key in EMPLOYEE_TABLE_COLUMNS
+                if key in DEFAULT_VISIBLE_EMPLOYEE_COLUMNS
+            ]
         frame, self.employees_canvas, self.employees_grid = self._make_scrollable_grid(
             self.employees_tab
         )
@@ -1198,14 +1548,15 @@ class MainWindow(tk.Tk):
     def _build_position_position_efficiency_tab(self):
         top = ttk.Frame(self.position_position_efficiency_tab)
         top.pack(fill="x", padx=10, pady=10)
-        ttk.Button(top, text="Refresh", command=self.refresh_from_sheet).pack(side="left")
+        ttk.Button(top, text="Update Employee Efficiency", command=self.run_employee_efficiency).pack(side="left")
+        ttk.Button(top, text="Refresh from Sheet", command=self.refresh_from_sheet).pack(side="left", padx=(6, 0))
         ttk.Button(top, text="Configure Positions", command=self._configure_position_efficiency_positions).pack(side="left", padx=(6, 0))
         self._add_company_selector(top)
         ttk.Label(
             top,
             text="Tornstats-projected work-stats effectiveness for every employee and position. "
-                 "Click a column heading to sort. Read straight from Position_Efficiency "
-                 "(Run Employee Efficiency Now to update).",
+                 "\nClick a column heading to sort. \nRead straight from Position_Efficiency "
+                 "(Update Employee Efficiency to update from Spreadsheet).",
             foreground="#555555",
             wraplength=460, justify="left",
         ).pack(side="left", padx=10)
@@ -1229,7 +1580,7 @@ class MainWindow(tk.Tk):
         if not all_positions:
             messagebox.showinfo(
                 "Configure Positions",
-                "No positions detected yet for this company - run Employee Efficiency first so "
+                "No positions detected yet for this company - update Employee Efficiency first so "
                 "positions can be read from Tornstats, then Configure Positions to add any it missed.",
             )
             return
@@ -1254,7 +1605,7 @@ class MainWindow(tk.Tk):
             self.position_efficiency_canvas.create_text(
                 10,
                 10,
-                text="No data yet - run Employee Efficiency first.",
+                text="No data yet - update Employee Efficiency first.",
                 anchor="nw",
                 fill="#000000",
             )
@@ -1403,6 +1754,12 @@ class MainWindow(tk.Tk):
         top.pack(fill="x", padx=10, pady=10)
         ttk.Button(top, text="Refresh", command=self.refresh_from_sheet).pack(side="left")
         self._add_company_selector(top)
+        ttk.Label(
+            top,
+            text="Shows stock information (in-stock, sold, cost, price, created) \nand a chart of total sold worth over time. ",
+            foreground="#555555",
+            wraplength=460, justify="left",
+        ).pack(side="left", padx=10)
 
         paned = ttk.PanedWindow(self.stock_tab, orient="vertical")
         paned.pack(fill="both", expand=True, padx=10, pady=(0, 10))
@@ -1534,12 +1891,10 @@ class MainWindow(tk.Tk):
         # accidentally overwrite one company's key while trying to add
         # another one.
         self._settings_vars = {
-            "google_oauth_client_file": tk.StringVar(value=self.settings.google_oauth_client_file),
             "snapshot_interval_minutes": tk.StringVar(value=str(self.settings.snapshot_interval_minutes)),
         }
 
         labels = {
-            "google_oauth_client_file": "Google OAuth desktop-client JSON file",
             "snapshot_interval_minutes": "Auto-refresh interval (minutes, 0 = off)",
         }
 
@@ -1548,8 +1903,6 @@ class MainWindow(tk.Tk):
             ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", pady=6)
             entry = ttk.Entry(frame, textvariable=self._settings_vars[key], width=50)
             entry.grid(row=row, column=1, sticky="we", pady=6, padx=6)
-            if key == "google_oauth_client_file":
-                ttk.Button(frame, text="Browse...", command=self._browse_oauth_client).grid(row=row, column=2)
             row += 1
 
         frame.columnconfigure(1, weight=1)
@@ -1561,7 +1914,6 @@ class MainWindow(tk.Tk):
         row += 1
         legacy_btn_row = ttk.Frame(frame)
         legacy_btn_row.grid(row=row, column=0, columnspan=2, pady=(0, 8), sticky="w")
-        ttk.Button(legacy_btn_row, text="Remove Legacy Plaintext Files", command=self._remove_legacy_files).pack(side="left")
         ttk.Button(legacy_btn_row, text="Sort Existing Rows (One-Time)", command=self._resort_existing_history).pack(side="left", padx=(8, 0))
         row += 1
         sep = ttk.Separator(frame, orient="horizontal")
@@ -1569,8 +1921,8 @@ class MainWindow(tk.Tk):
         row += 1
         ttk.Label(
             frame,
-            text="Companies - each needs its own Torn API key (Google Sheet ID is optional; "
-                 "leave it blank to auto-create one named after the company).\n"
+            text="Companies - each needs its own Torn API key. Leave the Sheet blank to "
+                 "auto-create one, or select a company and use Choose Google Sheet.\n"
                  "Every company here gets snapshotted when you click \"Run Snapshot Now\".",
             justify="left",
         ).grid(row=row, column=0, columnspan=2, sticky="w")
@@ -1582,19 +1934,14 @@ class MainWindow(tk.Tk):
         btn_frame.grid(row=row, column=2, sticky="n")
         ttk.Button(btn_frame, text="Add", command=self._add_company).pack(fill="x")
         ttk.Button(btn_frame, text="Edit", command=self._edit_company).pack(fill="x", pady=6)
-        ttk.Button(btn_frame, text="Remove", command=self._remove_company).pack(fill="x")
-        ttk.Button(btn_frame, text="Test Connection", command=self._test_connection).pack(fill="x", pady=6)
+        ttk.Button(btn_frame, text="Choose Google Sheet", command=self._choose_google_sheet).pack(fill="x")
+        ttk.Button(btn_frame, text="Remove", command=self._remove_company).pack(fill="x", pady=6)
+        ttk.Button(btn_frame, text="Test Connection", command=self._test_connection).pack(fill="x")
         frame.columnconfigure(1, weight=1)
         self._refresh_companies_list()
 
-    def _browse_oauth_client(self):
-        path = filedialog.askopenfilename(title="Select Google OAuth desktop-client JSON", filetypes=[("JSON", "*.json")])
-        if path:
-            self._settings_vars["google_oauth_client_file"].set(path)
-
     def _save_settings(self):
         s = self.settings
-        s.google_oauth_client_file = self._settings_vars["google_oauth_client_file"].get().strip()
         try:
             s.snapshot_interval_minutes = int(self._settings_vars["snapshot_interval_minutes"].get().strip() or 0)
         except ValueError:
@@ -1609,7 +1956,7 @@ class MainWindow(tk.Tk):
 
         def worker():
             try:
-                authorize_google(self.settings.google_oauth_client_file)
+                authorize_google()
             except Exception as exc:
                 self.after(0, lambda: messagebox.showerror("Google sign-in failed", str(exc)))
                 self.after(0, lambda: self.set_status("Google sign-in failed."))
@@ -1655,34 +2002,6 @@ class MainWindow(tk.Tk):
             self.after(0, finish)
 
         threading.Thread(target=worker, daemon=True).start()
-
-    def _remove_legacy_files(self):
-        from app.config import LEGACY_ENV_PATH
-        legacy_paths = [LEGACY_ENV_PATH, companies_mod.COMPANIES_PATH]
-        project_root = companies_mod.PROJECT_ROOT
-        legacy_paths.append(project_root / "service-account.json")
-        existing = [path for path in legacy_paths if path.exists()]
-        if not existing:
-            messagebox.showinfo("No plaintext files", "No legacy plaintext credential files were found.")
-            return
-        names = "\n".join(f"• {path.name}" for path in existing)
-        if not messagebox.askyesno(
-            "Remove plaintext files?",
-            "Settings/companies saved with this version are encrypted for your Windows user.\n\n"
-            f"Remove these plaintext files now?\n{names}\n\n"
-            "This does not securely erase data from disk; rotate previously exposed keys.",
-        ):
-            return
-        failures = []
-        for path in existing:
-            try:
-                path.unlink()
-            except OSError:
-                failures.append(path.name)
-        if failures:
-            messagebox.showerror("Could not remove files", "Could not remove: " + ", ".join(failures))
-        else:
-            messagebox.showinfo("Removed", "Plaintext legacy files were removed.")
 
     def _test_connection(self):
         self._save_settings()
@@ -1811,7 +2130,7 @@ class MainWindow(tk.Tk):
                         messages.append(line)
                     else:
                         messages.append(f"{name}: FAIL - {res.message}")
-                self.set_status("Employee efficiency run complete.")
+                self.set_status("Employee efficiency update complete.")
                 self.refresh_from_sheet()
                 messagebox.showinfo("Employee Efficiency Results", "\n".join(messages))
             self.after(0, finish)
@@ -1936,6 +2255,38 @@ class MainWindow(tk.Tk):
         except Exception:
             pass
 
+    def _choose_google_sheet(self):
+        sel = self._companies_listbox.curselection()
+        if not sel:
+            messagebox.showinfo("Select one", "Select a company first.")
+            return
+        company = self.companies[sel[0]]
+        self.set_status(f"Choose a Google Sheet for {company.get('name', 'company')} in your browser...")
+
+        def worker():
+            try:
+                sheet_id = pick_google_sheet()
+            except Exception as exc:
+                self.after(0, lambda: messagebox.showerror("Google Picker failed", str(exc)))
+                self.after(0, lambda: self.set_status("Google Sheet selection failed."))
+                return
+
+            def finish():
+                if company not in self.companies:
+                    return
+                company["google_sheet_id"] = sheet_id
+                companies_mod.save_companies(self.companies)
+                idx = self.companies.index(company)
+                self._refresh_companies_list()
+                self._companies_listbox.selection_set(idx)
+                self._companies_listbox.see(idx)
+                self.set_status(f"Google Sheet selected for {company.get('name', 'company')}.")
+                messagebox.showinfo("Google Sheet selected", "The selected Sheet is now assigned to this company.")
+
+            self.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _add_company(self):
         name = simpledialog.askstring("Company name", "Name for company", parent=self)
         if not name:
@@ -1951,19 +2302,13 @@ class MainWindow(tk.Tk):
             parent=self, show="*",
         )
         tornstats = simpledialog.askstring("Tornstats API key", "Tornstats API key (optional)", parent=self, show="*")
-        sheet_id = simpledialog.askstring(
-            "Google Sheet ID",
-            "ID of an existing Google Sheet to use (optional - leave blank and a new "
-            "Sheet named after this company will be created automatically on first run)",
-            parent=self,
-        )
         sheet_name = simpledialog.askstring("Google Sheet name", "Optional display name", parent=self)
         entry = {
             "name": name.strip(),
             "torn_api_key": torn.strip(),
             "torn_public_api_key": (torn_public or "").strip(),
             "tornstats_api_key": (tornstats or "").strip(),
-            "google_sheet_id": (sheet_id or "").strip(),
+            "google_sheet_id": "",
             "google_sheet_name": (sheet_name or "").strip(),
         }
         self.companies.append(entry)
@@ -1972,6 +2317,10 @@ class MainWindow(tk.Tk):
         except Exception:
             messagebox.showerror("Save failed", "Could not save companies to companies.json")
         self._refresh_companies_list()
+        new_index = len(self.companies) - 1
+        self._companies_listbox.selection_set(new_index)
+        self._companies_listbox.see(new_index)
+        self._choose_google_sheet()
 
     def _edit_company(self):
         sel = self._companies_listbox.curselection()
@@ -1994,19 +2343,12 @@ class MainWindow(tk.Tk):
             initialvalue=c.get("torn_public_api_key", ""), parent=self, show="*",
         )
         tornstats = simpledialog.askstring("Tornstats API key", "Tornstats API key (optional)", initialvalue=c.get("tornstats_api_key", ""), parent=self, show="*")
-        sheet_id = simpledialog.askstring(
-            "Google Sheet ID",
-            "ID of an existing Google Sheet to use (optional - leave blank and a new "
-            "Sheet named after this company will be created automatically on next run)",
-            initialvalue=c.get("google_sheet_id", ""), parent=self,
-        )
         sheet_name = simpledialog.askstring("Google Sheet name", "Optional display name", initialvalue=c.get("google_sheet_name", ""), parent=self)
         c.update({
             "name": name.strip(),
             "torn_api_key": torn.strip(),
             "torn_public_api_key": (torn_public or "").strip(),
             "tornstats_api_key": (tornstats or "").strip(),
-            "google_sheet_id": (sheet_id or "").strip(),
             "google_sheet_name": (sheet_name or "").strip(),
         })
         try:
