@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+import os
 import webbrowser
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -62,15 +63,27 @@ def _authorization_params(pick_sheet: bool) -> dict:
 
 
 def _client_config_path() -> Path:
+    # 1. Check if running frozen inside a standalone build
     if getattr(sys, "frozen", False):
-        bundle_root = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
-        path = bundle_root / _BUNDLED_CLIENT_RESOURCE
+        # Nuitka unpacks bundled files directly into the directory containing the code modules
+        bundle_root = Path(__file__).resolve().parent
+        
+        # Look for the exact filename bundled by Nuitka
+        path = bundle_root / "client_secret.json"
         if path.is_file():
             return path
+            
         raise RuntimeError("This production build is missing its internal Google OAuth configuration.")
+
+    # 2. Local fallback branch for your standard development workflow
     matches = sorted(_PROJECT_ROOT.glob("client_secret_*.json"))
     if len(matches) == 1:
         return matches[0]
+        
+    exact_dev_file = _PROJECT_ROOT / "client_secret.json"
+    if exact_dev_file.is_file():
+        return exact_dev_file
+        
     raise RuntimeError("The development OAuth configuration is missing or ambiguous.")
 
 
