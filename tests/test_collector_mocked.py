@@ -250,13 +250,14 @@ class TestCollectorEmployeeEfficiency:
             "best_fit_position": "Director",
         }) is False
 
-    def test_employee_table_defaults_use_torn_current_position_effectiveness(self):
+    def test_employee_table_defaults_use_tornstats_projected_current_position_effectiveness(self):
         from gui.main_window import EMPLOYEE_TABLE_COLUMNS, DEFAULT_VISIBLE_EMPLOYEE_COLUMNS
 
         labels = {key: label for label, key in EMPLOYEE_TABLE_COLUMNS}
-        assert labels["effectiveness_working_stats"] == "Current Pos.\nEff."
-        assert "effectiveness_working_stats" in DEFAULT_VISIBLE_EMPLOYEE_COLUMNS
-        assert "projected_efficiency_current_position" not in DEFAULT_VISIBLE_EMPLOYEE_COLUMNS
+        assert labels["projected_efficiency_current_position"] == "Current\nEff."
+        assert labels["effectiveness_working_stats"] == "Work Stats\nEff."
+        assert "projected_efficiency_current_position" in DEFAULT_VISIBLE_EMPLOYEE_COLUMNS
+        assert "effectiveness_working_stats" not in DEFAULT_VISIBLE_EMPLOYEE_COLUMNS
 
     def test_missing_tornstats_key_returns_error(self, patch_torn, test_settings):
         from app.collector import Collector

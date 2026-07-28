@@ -18,6 +18,8 @@ oauth-client.json
 opencode.json
 AGENTS.md
 client_secret_*.json
+**/test.dist
+**/test.build
 
 # User-specific files (MonoDevelop/Xamarin Studio)
 *.userprefs

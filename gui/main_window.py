@@ -130,6 +130,34 @@ def format_time_since(value) -> str:
     return f"{minutes}m ago"
 
 
+def build_employee_info_card_fields(record: dict | None) -> list[tuple[str, str]]:
+    """Employee_Effectiveness row -> ordered (label, formatted value) pairs
+    for the Position Efficiency tab's employee info card popup. Pure and
+    Tk-independent so it's testable without a real widget. record is None
+    (or {}) when the clicked employee's tId has no matching row in the
+    Employee_Effectiveness sheet (stale cache / sheet edited externally) -
+    the caller is expected to show its own "not found" message in that
+    case rather than call this with no data.
+
+    "Current Eff." reuses the same terminology/field as the Employees and
+    Position Efficiency tabs' own "Current Eff." column
+    (projected_efficiency_current_position, Tornstats' projection at the
+    employee's current position) rather than Torn's own "Work Stats Eff."
+    (effectiveness_working_stats), for consistency with the rest of the app."""
+    record = record or {}
+    return [
+        ("Name", str(record.get("name", "") or "")),
+        ("ID", str(record.get("tId", "") or "")),
+        ("Last Online", format_time_since(record.get("last_action_ts")) or "Unknown"),
+        ("Manual Labor", format_int(record.get("manual_labor"))),
+        ("Endurance", format_int(record.get("endurance"))),
+        ("Intelligence", format_int(record.get("intelligence"))),
+        ("Current Position", str(record.get("current_position", "") or "")),
+        ("Current Eff.", format_int(record.get("projected_efficiency_current_position"))),
+        ("Total Eff.", format_int(record.get("effectiveness_total"))),
+    ]
+
+
 def format_signed_int(value) -> str:
     """'50' -> '+50', '-20' -> '-20', '0'/blank -> '0'. Used for day-over-day
     deltas so an increase vs. a decrease is obvious at a glance."""
@@ -189,6 +217,7 @@ EMPLOYEE_FOOTER_TOTAL_COLUMNS = {
     "wage",
     "effectiveness_total",
     "effectiveness_working_stats",
+    "projected_efficiency_current_position",
     "effectiveness_settled_in",
     "effectiveness_director_education",
     "effectiveness_addiction",
@@ -373,7 +402,7 @@ EMPLOYEE_TABLE_COLUMNS = [
 # a first-time user with all 26 columns at once.
 DEFAULT_VISIBLE_EMPLOYEE_COLUMNS = {
     "tId", "name", "wage", "current_position", "projected_efficiency_current_position",
-    "assigned_position", "assigned_efficiency", "effectiveness_settled_in", "effectiveness_education",
+    "assigned_position", "assigned_efficiency", "effectiveness_settled_in", "effectiveness_director_education",
     "effectiveness_addiction", "effectiveness_inactivity", "effectiveness_management", 
     "effectiveness_book", "effectiveness_merits", "effectiveness_total", "time_since_last_action", 
 }
@@ -787,6 +816,96 @@ class PositionVisibilityDialog(tk.Toplevel):
     def _save(self):
         self.result = {"visible": [pos for pos in self.positions if self.vars[pos].get()]}
         self.destroy()
+
+
+class EmployeeInfoCard(tk.Toplevel):
+    """
+    Small popup shown when a Name cell is clicked on the Position Efficiency
+    tab: Name, ID (tId, labeled "ID" in the GUI only), Last Online, Work
+    Stats (Manual Labor/Endurance/Intelligence), Current Position, Current
+    Eff., and Total Eff. for that one employee.
+
+    Non-modal by design (no grab_set()) - clicking another employee's Name
+    cell while a card is already open just opens/updates a card rather than
+    being blocked, so multiple employees can be looked at side by side.
+
+    record is the raw Employee_Effectiveness row dict for the employee, or
+    None if the lookup by tId came up empty (stale cache / sheet edited
+    externally since the last Position Efficiency refresh) - a short
+    explanatory message is shown instead of a broken/blank card in that case.
+    """
+
+    def __init__(self, master, record: dict | None):
+        super().__init__(master)
+        self.resizable(False, False)
+        self.transient(master)
+
+        name = (record or {}).get("name") or "Employee"
+        self.title(f"{name} - Info")
+
+        content = ttk.Frame(self, padding=16)
+        content.pack(fill="both", expand=True)
+
+        if record is None:
+            ttk.Label(
+                content,
+                text=(
+                    "No current data found for this employee.\n"
+                    "Try Refresh from Sheet or Update Employee Efficiency."
+                ),
+                justify="left",
+                wraplength=280,
+            ).pack(anchor="w")
+            ttk.Button(content, text="Close", command=self.destroy).pack(pady=(16, 0))
+            self._center_on_screen()
+            return
+
+        # A scrollable body - the canvas/window are sized to the body's own
+        # required size below (after the fields are laid out), rather than
+        # a fixed guessed box, so there's no empty space next to the labels.
+        # Scrolling only actually engages if the content ever outgrows
+        # MAX_BODY_HEIGHT - future-proofing for more fields being added
+        # later while keeping today's short field list compact.
+        MAX_BODY_HEIGHT = 260
+        canvas = tk.Canvas(content, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(content, orient="vertical", command=canvas.yview)
+        body = ttk.Frame(canvas)
+        window_id = canvas.create_window((0, 0), window=body, anchor="nw")
+        body.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+
+        for row_index, (label, value) in enumerate(build_employee_info_card_fields(record)):
+            ttk.Label(body, text=label, font=("Segoe UI", 9, "bold")).grid(
+                row=row_index, column=0, sticky="w", padx=(0, 12), pady=3
+            )
+            ttk.Label(body, text=value).grid(row=row_index, column=1, sticky="w", pady=3)
+
+        ttk.Button(content, text="Close", command=self.destroy).pack(pady=(12, 0))
+
+        # Now that the fields are laid out, size the canvas/scroll window to
+        # match the body's actual required size instead of a hardcoded box.
+        body.update_idletasks()
+        body_width = body.winfo_reqwidth()
+        body_height = body.winfo_reqheight()
+        canvas.configure(width=body_width, height=min(body_height, MAX_BODY_HEIGHT))
+        canvas.itemconfig(window_id, width=body_width)
+        if body_height > MAX_BODY_HEIGHT:
+            scrollbar.pack(side="right", fill="y")
+
+        self._center_on_screen()
+
+    def _center_on_screen(self):
+        self.update_idletasks()
+        # winfo_width()/height() report 1 until the window is actually
+        # mapped by the OS window manager, which update_idletasks() alone
+        # doesn't guarantee - the requested size is reliable regardless of
+        # mapping state, so use that for the centering math instead.
+        width = self.winfo_reqwidth()
+        height = self.winfo_reqheight()
+        x = (self.winfo_screenwidth() - width) // 2
+        y = (self.winfo_screenheight() - height) // 2
+        self.geometry(f"+{x}+{y}")
 
 
 class MainWindow(tk.Tk):
@@ -1566,6 +1685,7 @@ class MainWindow(tk.Tk):
         )
         frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         self._position_efficiency_records_cache = []
+        self._employee_info_lookup = {}
         self._position_efficiency_columns = ()
         self._position_efficiency_labels = {}
         self._position_efficiency_sort_column = None
@@ -1600,6 +1720,21 @@ class MainWindow(tk.Tk):
     def _populate_position_efficiency(self):
         records = self._safe_read("Position_Efficiency")
         self._position_efficiency_records_cache = records
+
+        # Independent lookup for the employee info card popup - read fresh
+        # from Employee_Effectiveness (not the Employees tab's cache/fallback,
+        # which uses a different position-key name and lacks work stats).
+        # Position_Efficiency and Employee_Effectiveness are always written
+        # together by the same run_employee_efficiency() call, so if a
+        # Position_Efficiency row exists here, its matching
+        # Employee_Effectiveness row is guaranteed to exist too.
+        info_records = self._safe_read("Employee_Effectiveness")
+        self._employee_info_lookup = {
+            str(record.get("tId")): record
+            for record in info_records
+            if record.get("tId") not in (None, "")
+        }
+
         if not records:
             self.position_efficiency_canvas.delete("all")
             self.position_efficiency_canvas.create_text(
@@ -1693,6 +1828,7 @@ class MainWindow(tk.Tk):
 
         for row_index, record in enumerate(records, start=1):
             current_position = record.get("current_position") or ""
+            employee_tid = record.get("tId")
             x = 0
             y = header_height + (row_index - 1) * row_height
             for column in columns:
@@ -1710,6 +1846,10 @@ class MainWindow(tk.Tk):
                     anchor = "center"
                 is_current_position = column == current_position
                 border_width = 3 if is_current_position else 1
+                cell_tags = ()
+                if column == "name":
+                    # Clickable - opens the employee info card popup.
+                    cell_tags = (f"pe_name_cell_{row_index}",)
                 canvas.create_rectangle(
                     x,
                     y,
@@ -1718,6 +1858,7 @@ class MainWindow(tk.Tk):
                     fill=background,
                     outline="#333333" if is_current_position else "#b0b0b0",
                     width=border_width,
+                    tags=cell_tags,
                 )
                 canvas.create_text(
                     x + 6 if anchor == "w" else x + width / 2,
@@ -1726,12 +1867,26 @@ class MainWindow(tk.Tk):
                     fill=foreground,
                     font=body_font,
                     anchor="w" if anchor == "w" else "center",
+                    tags=cell_tags,
                 )
+                if column == "name":
+                    tag = cell_tags[0]
+                    canvas.tag_bind(
+                        tag,
+                        "<Button-1>",
+                        lambda event, tid=employee_tid: self._show_employee_info_card(tid),
+                    )
+                    canvas.tag_bind(tag, "<Enter>", lambda event: canvas.configure(cursor="hand2"))
+                    canvas.tag_bind(tag, "<Leave>", lambda event: canvas.configure(cursor=""))
                 x += width
 
         total_width = sum(widths.values())
         total_height = header_height + len(records) * row_height
         canvas.configure(scrollregion=(0, 0, total_width, total_height))
+
+    def _show_employee_info_card(self, tid):
+        record = self._employee_info_lookup.get(str(tid)) if tid not in (None, "") else None
+        EmployeeInfoCard(self, record)
 
     def _sort_position_efficiency(self, column, reverse, toggle=True):
         if toggle and column == self._position_efficiency_sort_column:

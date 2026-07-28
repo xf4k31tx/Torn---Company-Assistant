@@ -27,19 +27,23 @@ The packaged executable is currently named `Knotty Oil Tracker.exe`.
   tracking, wage-efficiency flags, and trend charts.
 - Per-user Google OAuth and Windows DPAPI-protected local credentials.
 - Headless commands suitable for Windows Task Scheduler.
+- A separate TCA Checksum Verifier utility so downloaded releases can be
+  confirmed intact against a published SHA-256 manifest.
 
 ## Effectiveness and assignment rules
 
 Torn and Tornstats values have intentionally different roles:
 
-- **Current Pos. Eff.** is Torn's authoritative
+- **Work Stats Eff.** is Torn's authoritative
   `effectiveness_working_stats` value for the employee's current staffed
   position.
 - **Position Efficiency**, **Best Fit**, and **Assigned Eff.** use Tornstats
   projections for hypothetical positions.
-- The hidden-by-default **Current Pos. Projected Eff.** value remains available
-  through **Columns...** for internally consistent Tornstats comparisons. It
-  is not presented as the employee's real current effectiveness.
+- **Current Eff.**, visible by default, is the Tornstats-projected
+  (`projected_efficiency_current_position`) efficiency at the employee's
+  current position — for internally consistent Tornstats comparisons. It
+  is not presented as the employee's real current effectiveness; that is
+  **Work Stats Eff.** above.
 - **Misplaced** is true only when **Assigned Position** differs from the
   employee's current Torn position. Best Fit does not control this flag.
 - A checked **Lock** beside an employee's current position forces the next
@@ -64,8 +68,9 @@ The Employees grid includes:
 - Addiction and Inactivity values shown with a warning and red cell when the
   value is `-10` or lower.
 - Row warnings for misplaced employees and wage-efficiency outliers.
-- A Totals footer for Wage, Total Eff., Current Pos. Eff., Addiction Eff.,
-  Inactivity Eff., and Assigned Eff.
+- A Totals footer for Wage and every effectiveness column shown (Total,
+  Work Stats, Current, Settled In, Education, Addiction, Inactivity,
+  Management, Book, Merits), plus Assigned Eff.
 
 The **Run Employee Efficiency Now** button is located on this tab beside
 **Refresh**. Position locks and custom column selections are saved immediately.
@@ -79,9 +84,9 @@ individually colored, numerically sortable cells:
 | --- | --- |
 | Below 50 | Red |
 | 50–74 | Orange |
-| 75–99 | Yellow |
-| 100–124 | Green |
-| 125+ | Dark green |
+| 75–98 | Yellow |
+| 99–128 | Green |
+| 129+ | Dark green |
 
 Missing or nonnumeric projections remain neutral. **Configure Positions**
 controls which position columns are visible for the selected company.
@@ -181,9 +186,9 @@ The encrypted data is bound to the same Windows account and machine. Every user
 must authorize Google and configure credentials on each machine. DPAPI does not
 protect secrets from someone controlling the unlocked Windows account.
 
-Do not distribute a shared Google service-account private key. Each user signs
-in with their own Google account, and access is controlled through Google Sheet
-sharing.
+Each user signs in with their own Google account via the per-user OAuth flow
+described above; TCA does not use a shared Google service account. Access to
+a company's Sheet is controlled entirely through normal Google Sheet sharing.
 
 Employee-efficiency verification may be written locally to
 `logs\efficiency_verification.log`. The log can include employee names, Torn
@@ -191,10 +196,13 @@ IDs, company information, matching details, positions, and projected values.
 
 ## Migrating an older installation
 
-Legacy `.env` and `companies.json` values may be read once when encrypted
-settings do not yet exist. Save the migrated values securely, verify Google
-sign-in, and then use **Remove Legacy Plaintext Files** to remove `.env`,
-`companies.json`, and `service-account.json`.
+Legacy `.env` (read by `app/config.py`) and `companies.json` (read by
+`app/companies.py`) values are read once, automatically, only when no
+encrypted settings exist yet in DPAPI storage. Save the migrated values in
+**Settings**, or add/edit any company, to persist them into the encrypted
+store. There is no in-app action that deletes the legacy plaintext files —
+once migration is confirmed working, delete `.env` and `companies.json` from
+the project folder yourself.
 
 File deletion is not guaranteed secure erasure. Rotate or revoke keys and
 credentials that were previously shared, committed, or otherwise exposed.
@@ -229,7 +237,8 @@ python -m pytest
 The tests cover mocked collection and Google Sheet writes, secure settings,
 current-versus-projected effectiveness, misplaced calculations, position
 locks, score bands, warning thresholds, totals, sorting, company selectors,
-last-action formatting, and column persistence.
+last-action formatting, column persistence, checksum manifest parsing and
+file-integrity verification, and Google OAuth scope/config handling.
 
 ## Building the Windows executable
 
@@ -283,8 +292,11 @@ app/efficiency_calc.py  Projection, best-fit, locking, and assignment logic
 app/profit_calc.py      Profit fields and seven-day rolling averages
 app/sheets_client.py    Google Sheets access and automatic Sheet creation
 app/collector.py        Snapshot and Employee Efficiency orchestration
+app/checksum.py         SHA-256 hashing and .sha256 manifest parsing
 gui/main_window.py      Tkinter dashboard and settings interface
-scripts/                Manual maintenance and migration scripts
+verify_checksum.py      Standalone TCA Checksum Verifier GUI/CLI entry point
+scripts/generate_release_checksum.py  Writes a release build's .sha256 manifest
+scripts/backfill_company_history.py   One-off Company_History profit-formula migration
 tests/                  Pytest suite and mock endpoint data
 legal/                  Draft Terms of Service and Privacy Policy
 Knotty Oil Tracker.spec PyInstaller build specification
