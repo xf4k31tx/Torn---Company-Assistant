@@ -12,8 +12,10 @@ The packaged executable is currently named `Knotty Oil Tracker.exe`.
 
 ## Main features
 
-- Separate Overview, Employees, Position Efficiency, Stock & Profit, Trends,
-  and Settings tabs.
+- Overview, Employees, Stock & Profit Trends, and Settings top-level tabs.
+  Employees nests Employee Overview and a Position Efficiency parent with
+  Base Effectiveness Projections and Total Effectiveness Projections sub-tabs.
+  Stock & Profit Trends nests Stock and Company Trends sub-tabs.
 - A synchronized company selector across all data tabs. The last selected
   company persists between sessions.
 - Independent Snapshot and Employee Efficiency operations, plus a combined

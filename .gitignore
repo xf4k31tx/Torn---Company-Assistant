@@ -10,6 +10,7 @@
 *.userosscache
 *.sln.docstates
 *.env
+*.spec
 .env.example
 service-account.json
 companies.json
@@ -23,6 +24,16 @@ client_secret.json
 **/test.build
 TCA.exe
 TCA_Debug.exe
+TCA_Privacy_Policy.md
+TCA_Terms_of_Service.md
+TCA_Privacy_Policy-backup.docx
+TCA_Terms_of_Service-backup.docx
+**/main.build
+**/main.dist
+.firebaserc
+firebase.json
+index.html
+[Dd]ocs/
 
 # User-specific files (MonoDevelop/Xamarin Studio)
 *.userprefs

@@ -1,12 +1,17 @@
 """
 Desktop GUI for the Knotty Oil Tracker.
 
-Tabs:
-  Overview   - latest company-level snapshot + a "Run Snapshot Now" button
-  Employees  - current roster with Torn's per-employee effectiveness breakdown
-  Stock      - latest stock snapshot + a sold-worth trend chart
-  Trends     - pick any Company_History metric and chart it over time
-  Settings   - encrypted local API keys / Google OAuth / sheet target
+Tabs (nested structure as of Phase 1):
+  Overview                              - latest company-level snapshot + a "Run Snapshot Now" button
+  Employees (parent)
+    Employee Overview                   - current roster with Torn's per-employee effectiveness breakdown
+    Position Efficiency (parent)
+      Base Effectiveness Projections    - Tornstats work-stats projections per employee per position
+      Total Effectiveness Projections   - placeholder; wired with real data in Phase 2
+  Stock & Profit Trends (parent)
+    Stock                               - latest stock snapshot + a sold-worth trend chart
+    Company Trends                      - pick any Company_History metric and chart it over time
+  Settings                              - encrypted local API keys / Google OAuth / sheet target
 
 All data is read straight from the Google Sheet (via SheetsClient), so the
 GUI is safe to close and reopen without losing anything - the Sheet is the
@@ -20,10 +25,20 @@ import datetime
 import json
 import threading
 import time
+import sys
+import os
 import tkinter as tk
+import docx
 from pathlib import Path
+# Identify the root directory path 
+project_root = str(Path(__file__).resolve().parent.parent)
+# Append the root path index to Python's environment lookup tree if not already present
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 from tkinter import ttk, messagebox, simpledialog
 from tkinter import font as tkfont
+from tkinter import Toplevel, scrolledtext, END, Button
 
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
@@ -128,6 +143,38 @@ def format_time_since(value) -> str:
     if hours > 0:
         return f"{hours}h {minutes}m ago"
     return f"{minutes}m ago"
+
+def get_legal_text(relative_subpath: str) -> str:
+    """
+    Locates and extracts text paragraphs from a .docx Word document.
+    Accurately preserves the nested layout across loose script runs and compiled bundles.
+    """
+    if getattr(sys, "frozen", False):
+        # Target Nuitka's true internal temp extraction root directory
+        try:
+            main_module = sys.modules['__main__']
+            bundle_root = Path(main_module.__file__).resolve().parent
+        except Exception:
+            bundle_root = Path(sys.executable).parent
+    else:
+        # Standard local development folder tracking (shifts up from gui/)
+        bundle_root = Path(__file__).resolve().parent.parent
+
+    # Construct the path to your structured asset target
+    target_path = bundle_root / relative_subpath
+
+    # Debug fallback check showing the absolute path tried if a crash occurs
+    if not target_path.is_file():
+        return f"Error: [Internal Path: {target_path}] - {relative_subpath} missing from bundle."
+        
+    try:
+        doc = docx.Document(target_path)
+        full_text = []
+        for para in doc.paragraphs:
+            full_text.append(para.text)
+        return "\n".join(full_text)
+    except Exception as e:
+        return f"Error processing Word document: {str(e)}"
 
 
 def build_employee_info_card_fields(record: dict | None) -> list[tuple[str, str]]:
@@ -1120,6 +1167,45 @@ class MainWindow(tk.Tk):
         self._save_window_state()
         self.destroy()
 
+    # ----------------------------------------------------------legal docs---
+    def display_legal_window(self, title: str, relative_path: str):
+        """
+        Creates a standalone scrollable UI display modal window.
+        It handles reading the text content internally from the file path.
+        """
+        popup = Toplevel(self)
+        popup.title(title)
+        popup.geometry("600x500")
+
+        # Build the scrollable text widget with automated word-wrapping
+        text_box = scrolledtext.ScrolledText(
+            popup, 
+            wrap="word", 
+            font=("Segoe UI", 10), 
+            padx=15, 
+            pady=15
+            )
+        text_box.pack(expand=True, fill="both")
+
+        # 🟢 FIX: Fetch the raw markdown string safely right here using the string path
+        text_content = get_legal_text(relative_path)
+
+        # Inject the text variable string directly into the active layout framework
+        text_box.insert(END, text_content)
+
+        # Freeze editing layers so application users cannot manually alter text strings
+        text_box.config(state="disabled")
+
+    def show_privacy(self):
+        """Passes the strict file path string to the window generator."""
+        # 🟢 FIX: Only pass the exact path string, not loaded text data
+        self.display_legal_window("TCA - Privacy Policy", "legal/TCA_Privacy_Policy.docx")
+
+    def show_terms(self):
+        """Passes the strict file path string to the window generator."""
+        # 🟢 FIX: Only pass the exact path string, not loaded text data
+        self.display_legal_window("TCA - Terms of Service", "legal/TCA_Terms_of_Service.docx")
+
     # --------------------------------------------------------- tree utils --
     def _make_scrollable_tree(self, parent, columns, show="headings", height=15):
         """Wraps a Treeview with vertical + horizontal scrollbars in its own
@@ -1228,6 +1314,8 @@ class MainWindow(tk.Tk):
         file_menu = tk.Menu(menubar, tearoff=0)
         file_menu.add_command(label="Run Snapshot Now", command=self.run_snapshot)
         file_menu.add_command(label="Refresh From Sheet", command=self.refresh_from_sheet)
+        file_menu.add_command(label="TOS", command=self.show_terms)
+        file_menu.add_command(label="Privacy Policy", command=self.show_privacy)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.destroy)
         menubar.add_cascade(label="File", menu=file_menu)
@@ -1238,23 +1326,52 @@ class MainWindow(tk.Tk):
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True)
 
+        # -- Top-level tabs --
         self.overview_tab = ttk.Frame(self.notebook)
-        self.employees_tab = ttk.Frame(self.notebook)
-        self.position_position_efficiency_tab = ttk.Frame(self.notebook)
-        self.stock_tab = ttk.Frame(self.notebook)
-        self.trends_tab = ttk.Frame(self.notebook)
+        self.employees_parent_tab = ttk.Frame(self.notebook)
+        self.stock_trends_parent_tab = ttk.Frame(self.notebook)
         self.settings_tab = ttk.Frame(self.notebook)
 
         self.notebook.add(self.overview_tab, text="Overview")
-        self.notebook.add(self.employees_tab, text="Employees")
-        self.notebook.add(self.position_position_efficiency_tab, text="Position Efficiency")
-        self.notebook.add(self.stock_tab, text="Stock & Profit")
-        self.notebook.add(self.trends_tab, text="Trends")
+        self.notebook.add(self.employees_parent_tab, text="Employees")
+        self.notebook.add(self.stock_trends_parent_tab, text="Stock & Profit Trends")
         self.notebook.add(self.settings_tab, text="Settings")
 
+        # -- Employees sub-notebook: Employee Overview + Position Efficiency (nested) --
+        self.employees_notebook = ttk.Notebook(self.employees_parent_tab)
+        self.employees_notebook.pack(fill="both", expand=True)
+
+        self.employee_overview_tab = ttk.Frame(self.employees_notebook)
+        self.position_efficiency_parent_tab = ttk.Frame(self.employees_notebook)
+
+        self.employees_notebook.add(self.employee_overview_tab, text="Employee Overview")
+        self.employees_notebook.add(self.position_efficiency_parent_tab, text="Position Efficiency")
+
+        # -- Position Efficiency sub-notebook: Base + Total Effectiveness Projections --
+        self.position_efficiency_notebook = ttk.Notebook(self.position_efficiency_parent_tab)
+        self.position_efficiency_notebook.pack(fill="both", expand=True)
+
+        self.base_effectiveness_tab = ttk.Frame(self.position_efficiency_notebook)
+        self.total_effectiveness_tab = ttk.Frame(self.position_efficiency_notebook)
+
+        self.position_efficiency_notebook.add(self.base_effectiveness_tab, text="Base Effectiveness Projections")
+        self.position_efficiency_notebook.add(self.total_effectiveness_tab, text="Total Effectiveness Projections")
+
+        # -- Stock & Profit Trends sub-notebook: Stock + Company Trends --
+        self.stock_trends_notebook = ttk.Notebook(self.stock_trends_parent_tab)
+        self.stock_trends_notebook.pack(fill="both", expand=True)
+
+        self.stock_sub_tab = ttk.Frame(self.stock_trends_notebook)
+        self.company_trends_tab = ttk.Frame(self.stock_trends_notebook)
+
+        self.stock_trends_notebook.add(self.stock_sub_tab, text="Stock")
+        self.stock_trends_notebook.add(self.company_trends_tab, text="Company Trends")
+
+        # -- Build content for each tab --
         self._build_overview_tab()
         self._build_employees_tab()
-        self._build_position_position_efficiency_tab()
+        self._build_base_effectiveness_tab()
+        self._build_total_effectiveness_placeholder()
         self._build_stock_tab()
         self._build_trends_tab()
         self._build_settings_tab()
@@ -1354,7 +1471,7 @@ class MainWindow(tk.Tk):
 
     # -------------------------------------------------------- employees --
     def _build_employees_tab(self):
-        top = ttk.Frame(self.employees_tab)
+        top = ttk.Frame(self.employee_overview_tab)
         top.pack(fill="x", padx=10, pady=10)
         ttk.Button(top, text="Update Employee Efficiency", command=self.run_employee_efficiency).pack(side="left")
         ttk.Button(top, text="Refresh from Sheet", command=self.refresh_from_sheet).pack(side="left", padx=(6, 0))
@@ -1369,7 +1486,7 @@ class MainWindow(tk.Tk):
         filter_entry.bind("<KeyRelease>", lambda e: self._apply_employee_filter())
 
         legend = ttk.Label(
-            self.employees_tab,
+            self.employee_overview_tab,
             text="Current Effectiveness is from Torn API, every other eff. column is originated from Tornstats Calculations.  "
                  "Position locks apply on the next Employee Efficiency run.  "
                  "\n\u26a0 Misplaced = Assigned Position differs from current position.  "
@@ -1404,7 +1521,7 @@ class MainWindow(tk.Tk):
                 if key in DEFAULT_VISIBLE_EMPLOYEE_COLUMNS
             ]
         frame, self.employees_canvas, self.employees_grid = self._make_scrollable_grid(
-            self.employees_tab
+            self.employee_overview_tab
         )
         frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         self._employee_labels = {key: header for header, key in EMPLOYEE_TABLE_COLUMNS}
@@ -1663,9 +1780,9 @@ class MainWindow(tk.Tk):
             except Exception:
                 messagebox.showerror("Save failed", "Could not save companies to companies.json")
 
-    # ------------------------------------------------- position position_efficiency --
-    def _build_position_position_efficiency_tab(self):
-        top = ttk.Frame(self.position_position_efficiency_tab)
+    # ------------------------------------------ base effectiveness projections --
+    def _build_base_effectiveness_tab(self):
+        top = ttk.Frame(self.base_effectiveness_tab)
         top.pack(fill="x", padx=10, pady=10)
         ttk.Button(top, text="Update Employee Efficiency", command=self.run_employee_efficiency).pack(side="left")
         ttk.Button(top, text="Refresh from Sheet", command=self.refresh_from_sheet).pack(side="left", padx=(6, 0))
@@ -1680,8 +1797,8 @@ class MainWindow(tk.Tk):
             wraplength=460, justify="left",
         ).pack(side="left", padx=10)
 
-        frame, self.position_efficiency_canvas = self._make_scrollable_canvas(
-            self.position_position_efficiency_tab
+        frame, self.base_effectiveness_canvas = self._make_scrollable_canvas(
+            self.base_effectiveness_tab
         )
         frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         self._position_efficiency_records_cache = []
@@ -1690,6 +1807,16 @@ class MainWindow(tk.Tk):
         self._position_efficiency_labels = {}
         self._position_efficiency_sort_column = None
         self._position_efficiency_sort_reverse = False
+
+    # ----------------------------------------- total effectiveness projections --
+    def _build_total_effectiveness_placeholder(self):
+        """Empty placeholder for the Total Effectiveness Projections sub-tab.
+        Wired with real data in Phase 2."""
+        ttk.Label(
+            self.total_effectiveness_tab,
+            text="Total Effectiveness Projections — coming in Phase 2.",
+            foreground="#888888",
+        ).pack(padx=20, pady=20, anchor="nw")
 
     def _configure_position_efficiency_positions(self):
         company = self._active_company()
@@ -1717,8 +1844,14 @@ class MainWindow(tk.Tk):
                 return
             self._populate_position_efficiency()
 
-    def _populate_position_efficiency(self):
-        records = self._safe_read("Position_Efficiency")
+    def _populate_position_efficiency(self, sheet_name="Position_Efficiency", canvas=None):
+        """Populate the position efficiency grid from *sheet_name*.
+
+        *canvas* selects which scrollable canvas to render into; defaults to
+        self.base_effectiveness_canvas. Phase 2 will pass
+        self.total_effectiveness_canvas when populating the second sub-tab."""
+        canvas = canvas if canvas is not None else self.base_effectiveness_canvas
+        records = self._safe_read(sheet_name)
         self._position_efficiency_records_cache = records
 
         # Independent lookup for the employee info card popup - read fresh
@@ -1736,15 +1869,15 @@ class MainWindow(tk.Tk):
         }
 
         if not records:
-            self.position_efficiency_canvas.delete("all")
-            self.position_efficiency_canvas.create_text(
+            canvas.delete("all")
+            canvas.create_text(
                 10,
                 10,
                 text="No data yet - update Employee Efficiency first.",
                 anchor="nw",
                 fill="#000000",
             )
-            self.position_efficiency_canvas.configure(scrollregion=(0, 0, 320, 40))
+            canvas.configure(scrollregion=(0, 0, 320, 40))
             self._position_efficiency_all_positions = []
             return
 
@@ -1768,10 +1901,13 @@ class MainWindow(tk.Tk):
             self._position_efficiency_sort_column or "name",
             self._position_efficiency_sort_reverse,
             toggle=False,
+            canvas=canvas,
         )
 
-    def _render_position_efficiency_rows(self, records):
-        canvas = self.position_efficiency_canvas
+    def _render_position_efficiency_rows(self, records, canvas=None):
+        """Render *records* into *canvas* (defaults to self.base_effectiveness_canvas).
+        Phase 2 passes self.total_effectiveness_canvas for the second sub-tab."""
+        canvas = canvas if canvas is not None else self.base_effectiveness_canvas
         canvas.delete("all")
         columns = self._position_efficiency_columns
         labels = self._position_efficiency_labels
@@ -1822,7 +1958,7 @@ class MainWindow(tk.Tk):
             canvas.tag_bind(
                 tag,
                 "<Button-1>",
-                lambda event, col=column: self._sort_position_efficiency(col, False),
+                lambda event, col=column, cv=canvas: self._sort_position_efficiency(col, False, canvas=cv),
             )
             x += width
 
@@ -1888,7 +2024,11 @@ class MainWindow(tk.Tk):
         record = self._employee_info_lookup.get(str(tid)) if tid not in (None, "") else None
         EmployeeInfoCard(self, record)
 
-    def _sort_position_efficiency(self, column, reverse, toggle=True):
+    def _sort_position_efficiency(self, column, reverse, toggle=True, canvas=None):
+        """Sort and re-render the position efficiency grid.
+
+        *canvas* is forwarded to _render_position_efficiency_rows; defaults to
+        self.base_effectiveness_canvas. Phase 2 passes the total tab's canvas."""
         if toggle and column == self._position_efficiency_sort_column:
             reverse = not self._position_efficiency_sort_reverse
         elif toggle and column in {"name", "current_position"}:
@@ -1901,11 +2041,11 @@ class MainWindow(tk.Tk):
         )
         self._position_efficiency_sort_column = column
         self._position_efficiency_sort_reverse = reverse
-        self._render_position_efficiency_rows(records)
+        self._render_position_efficiency_rows(records, canvas=canvas)
 
     # ------------------------------------------------------------ stock --
     def _build_stock_tab(self):
-        top = ttk.Frame(self.stock_tab)
+        top = ttk.Frame(self.stock_sub_tab)
         top.pack(fill="x", padx=10, pady=10)
         ttk.Button(top, text="Refresh", command=self.refresh_from_sheet).pack(side="left")
         self._add_company_selector(top)
@@ -1916,7 +2056,7 @@ class MainWindow(tk.Tk):
             wraplength=460, justify="left",
         ).pack(side="left", padx=10)
 
-        paned = ttk.PanedWindow(self.stock_tab, orient="vertical")
+        paned = ttk.PanedWindow(self.stock_sub_tab, orient="vertical")
         paned.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
         columns = ["name", "in_stock", "delta_in_stock", "cost", "price", "sold_amount", "sold_worth", "created"]
@@ -1979,7 +2119,7 @@ class MainWindow(tk.Tk):
 
     # ----------------------------------------------------------- trends --
     def _build_trends_tab(self):
-        top = ttk.Frame(self.trends_tab)
+        top = ttk.Frame(self.company_trends_tab)
         top.pack(fill="x", padx=10, pady=10)
 
         ttk.Label(top, text="Metric:").pack(side="left")
@@ -1990,7 +2130,7 @@ class MainWindow(tk.Tk):
         ttk.Button(top, text="Refresh", command=self.refresh_from_sheet).pack(side="left", padx=6)
         self._add_company_selector(top)
 
-        chart_frame = ttk.Frame(self.trends_tab)
+        chart_frame = ttk.Frame(self.company_trends_tab)
         chart_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         self.trend_fig = Figure(figsize=(8, 4), dpi=100)
         self.trend_ax = self.trend_fig.add_subplot(111)
