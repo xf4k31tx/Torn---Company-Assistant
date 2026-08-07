@@ -1,16 +1,19 @@
 # Torn Company Assistant Web-Migration Roadmap
 
-**Status:** Phase 1 in progress
-**Date:** 2026-08-06
+**Status:** Phase 1 complete; Phase 2 next
+**Date:** 2026-08-07
 **Architecture:** [ADR-001: Web Application Migration](../architecture/ADR-001-web-application-migration.md)
 
 ## Current implementation status
 
 - Phase 0 repository, architecture decisions, migration boundaries, and unchanged-file inventory are established.
-- Phase 1 has typed application contracts, progress events, service ports, and an asynchronous Torn API v2 adapter.
+- Phase 1 provides typed collection requests/results/data envelopes, deterministic progress events, and service ports for Torn, Torn Stats, persistence, jobs, and local workbooks.
+- Framework-free Snapshot, Employee Efficiency, Run Everything, history-import, and scheduled-collection workflows run against mocked gateways and in-memory persistence.
+- Async Torn and Torn Stats adapters sanitize transport failures without disclosing API keys.
 - Torn API routes and response envelopes are implemented against `docs/planning/openapi.json`, the authoritative checked-in contract. Its live upstream source is `https://www.torn.com/swagger/openapi.json`.
 - Reusable profit, ranking, income-tracking, and checksum tests have been ported as desktop-to-web calculation parity coverage.
-- Collector workflow extraction, Torn Stats adaptation, persistence adapters, and workbook services remain in Phase 1.
+- Position locks, assigned-position misplacement, Torn-authoritative current effectiveness, Torn Stats projections, stock deltas, profit/income, ranking, and star-band rules have desktop-to-web parity coverage.
+- Phase 1 exit gates pass: the core imports no Tkinter or Google modules, strict type and lint checks pass, and progress stage sequences are tested.
 
 ## Guiding decisions
 

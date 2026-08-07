@@ -76,6 +76,59 @@ class EmployeeEfficiencyResult(BaseModel):
     verification_note: str = ""
 
 
+class CollectionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    workspace_id: str = Field(min_length=1)
+    company_id: int = Field(gt=0)
+    position_capacities: dict[str, int] = Field(default_factory=dict)
+    position_priority_order: list[str] = Field(default_factory=list)
+    locked_employee_ids: set[str] = Field(default_factory=set)
+
+
+class SnapshotData(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    timestamp: int = Field(gt=0)
+    company: JsonObject
+    employees: list[JsonObject]
+    stock: list[JsonObject]
+    rankings: list[JsonObject]
+    director_efficiency: list[JsonObject] = Field(default_factory=list)
+
+
+class EmployeeEfficiencyData(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    timestamp: int = Field(gt=0)
+    employees: list[JsonObject]
+    position_names: list[str]
+    position_efficiency: list[JsonObject]
+    total_effectiveness_projections: list[JsonObject]
+    turnover: list[JsonObject]
+
+
+class EverythingResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    snapshot: SnapshotResult
+    employee_efficiency: EmployeeEfficiencyResult
+
+
+class ImportHistoryResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    imported_count: int = Field(ge=0)
+    skipped_count: int = Field(ge=0)
+
+
+class ScheduledCollectionResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    operation: Operation
+    result: SnapshotResult | EmployeeEfficiencyResult | EverythingResult
+
+
 class ServiceError(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 

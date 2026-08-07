@@ -8,9 +8,12 @@ from tca_web.application.contracts import (
     CompanyEmployeesResponse,
     CompanyProfileResponse,
     CompanyStockResponse,
+    EmployeeEfficiencyData,
+    ImportHistoryResult,
     JsonObject,
     KeyInfoResponse,
     ProgressEvent,
+    SnapshotData,
     TimestampResponse,
 )
 
@@ -38,16 +41,42 @@ class TornGateway(Protocol):
 
 @runtime_checkable
 class TornStatsGateway(Protocol):
-    async def get_company_efficiency(self, company_id: int) -> JsonObject: ...
+    async def get_efficiency(
+        self,
+        manual_labor: int | None = None,
+        intelligence: int | None = None,
+        endurance: int | None = None,
+    ) -> JsonObject: ...
 
 
 @runtime_checkable
-class SnapshotRepository(Protocol):
-    async def save_snapshot(self, workspace_id: str, company_id: int, data: JsonObject) -> str: ...
+class CompanyDataRepository(Protocol):
+    async def save_snapshot(
+        self,
+        workspace_id: str,
+        company_id: int,
+        data: SnapshotData,
+        *,
+        is_update: bool,
+    ) -> None: ...
 
-    async def load_latest_snapshot(
+    async def load_company_history(
         self, workspace_id: str, company_id: int
-    ) -> JsonObject | None: ...
+    ) -> list[JsonObject]: ...
+
+    async def load_stock_history(self, workspace_id: str, company_id: int) -> list[JsonObject]: ...
+
+    async def load_employee_effectiveness(
+        self, workspace_id: str, company_id: int
+    ) -> list[JsonObject]: ...
+
+    async def save_employee_efficiency(
+        self, workspace_id: str, company_id: int, data: EmployeeEfficiencyData
+    ) -> None: ...
+
+    async def import_history(
+        self, workspace_id: str, company_id: int, records: list[JsonObject]
+    ) -> ImportHistoryResult: ...
 
 
 @runtime_checkable
@@ -61,4 +90,11 @@ class ProgressSink(Protocol):
 class WorkbookPort(Protocol):
     async def export_history(self, workspace_id: str, company_id: int) -> bytes: ...
 
-    async def preview_import(self, workspace_id: str, content: bytes) -> JsonObject: ...
+    async def parse_history(self, content: bytes) -> list[JsonObject]: ...
+
+
+@runtime_checkable
+class JobPort(Protocol):
+    async def enqueue(
+        self, operation: str, workspace_id: str, company_id: int, payload: JsonObject
+    ) -> str: ...

@@ -1,11 +1,11 @@
 {
     "schema_version": 2,
-    "commit": "HEAD",
-    "indexed_at": "2026-08-07T04:52:22Z",
+    "commit": "7b6c0ac88e1c6fd87d6c1f06d5f3a34a5a00373e",
+    "indexed_at": "2026-08-07T05:37:21Z",
     "project": "E-repos-Torn-Company-Assistant-Web",
-    "nodes": 366,
-    "edges": 1214,
-    "original_size": 2097152,
-    "compressed_size": 319934,
-    "compression_level": 9
+    "nodes": 476,
+    "edges": 1904,
+    "original_size": 2818048,
+    "compressed_size": 177488,
+    "compression_level": 3
 }
