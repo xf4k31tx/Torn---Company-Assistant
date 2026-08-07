@@ -1,0 +1,32 @@
+:root {
+  color: #f5f7fa;
+  background: #17191d;
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+}
+
+body {
+  margin: 0;
+}
+
+.app-shell {
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  padding: 2rem;
+}
+
+.app-card {
+  max-width: 42rem;
+  padding: 3rem;
+  border: 1px solid #41454d;
+  border-radius: 1rem;
+  background: #23262c;
+  text-align: center;
+}
+
+.eyebrow {
+  color: #9aa2ad;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}

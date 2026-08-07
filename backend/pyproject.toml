@@ -1,0 +1,81 @@
+[project]
+name = "tca-web-backend"
+version = "0.1.0"
+description = "Torn Company Assistant web API and background workers"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "alembic>=1.19.0",
+    "argon2-cffi>=25.1.0",
+    "asyncpg>=0.31.0",
+    "celery[redis]>=5.6.3",
+    "cryptography>=50.0.0",
+    "email-validator>=2.3.0",
+    "fastapi[standard]>=0.141.1",
+    "httpx>=0.28.1",
+    "openpyxl>=3.1.5",
+    "prometheus-client>=0.26.0",
+    "pydantic-settings>=2.14.2",
+    "pyotp>=2.10.0",
+    "python-multipart>=0.0.32",
+    "redis>=6.4.0",
+    "sqlalchemy[asyncio]>=2.0.51",
+    "structlog>=26.1.0",
+    "tenacity>=9.1.4",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "freezegun>=1.5.5",
+    "httpx2>=2.9.1",
+    "mypy>=2.3.0",
+    "pip-audit>=2.10.1",
+    "pre-commit>=4.6.1",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "pytest-cov>=7.1.0",
+    "respx>=0.23.1",
+    "ruff>=0.16.1",
+    "testcontainers[postgres,redis]>=4.13.3",
+    "types-openpyxl>=3.1.5.20260724",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tca_web"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+asyncio_mode = "auto"
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.format]
+exclude = ["src/tca_web/domain/*.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+
+[tool.ruff.lint.per-file-ignores]
+"src/tca_web/domain/checksum.py" = ["I001"]
+"src/tca_web/domain/income_tracking.py" = ["UP017"]
+"src/tca_web/domain/profit_calc.py" = ["E501", "UP017", "UP035"]
+"src/tca_web/domain/ranking_calc.py" = ["E501", "UP017", "UP045"]
+
+[[tool.mypy.overrides]]
+module = [
+    "tca_web.domain.income_tracking",
+    "tca_web.domain.profit_calc",
+    "tca_web.domain.ranking_calc",
+]
+ignore_errors = true

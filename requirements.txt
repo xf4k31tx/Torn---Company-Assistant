@@ -1,9 +1,0 @@
-requests>=2.34.2
-gspread>=6.2.1
-google-auth>=2.56.0
-google-auth-oauthlib>=1.4.0
-python-dotenv>=1.2.2
-python-docx>=1.2.0
-matplotlib>=3.11.1
-pyinstaller>=6.21.0
-pytest>=9.1.1
