@@ -15,5 +15,8 @@ describe("App", () => {
     expect(
       screen.getByRole("heading", { name: "Torn Company Assistant" }),
     ).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "Local history workbook" }),
+    ).toBeInTheDocument();
   });
 });

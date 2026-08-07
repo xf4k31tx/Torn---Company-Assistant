@@ -11,6 +11,7 @@ backend/.venv/
 .ruff_cache/
 .coverage
 htmlcov/
+backups/
 
 # Node
 frontend/node_modules/

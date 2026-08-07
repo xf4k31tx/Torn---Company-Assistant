@@ -30,3 +30,46 @@ body {
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
+
+.local-tools {
+  margin-top: 2rem;
+  padding-top: 1.5rem;
+  border-top: 1px solid #41454d;
+}
+
+.local-tools form,
+.local-tools label {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.local-tools form {
+  grid-template-columns: 1fr 1fr;
+  text-align: left;
+}
+
+.local-tools input,
+.local-tools button,
+.button-link {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 2.75rem;
+  padding: 0.65rem 0.8rem;
+  border: 1px solid #59606b;
+  border-radius: 0.5rem;
+  color: inherit;
+  background: #17191d;
+}
+
+.local-tools button,
+.button-link {
+  cursor: pointer;
+  text-align: center;
+  text-decoration: none;
+}
+
+@media (max-width: 42rem) {
+  .local-tools form {
+    grid-template-columns: 1fr;
+  }
+}

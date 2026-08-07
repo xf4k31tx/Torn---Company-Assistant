@@ -1,0 +1,257 @@
+name: tca-web
+
+x-backend-environment: &backend-environment
+  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-tca}:${POSTGRES_PASSWORD:-tca_local_development_only}@postgres:5432/${POSTGRES_DB:-tca}
+  REDIS_URL: redis://redis:6379/0
+  CELERY_BROKER_URL: redis://redis:6379/1
+  CELERY_RESULT_BACKEND: redis://redis:6379/2
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+x-backend-dependencies: &backend-dependencies
+  postgres:
+    condition: service_healthy
+  redis:
+    condition: service_healthy
+
+x-api-healthcheck: &api-healthcheck
+  test:
+    - CMD
+    - python
+    - -c
+    - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=3)"
+  interval: 5s
+  timeout: 5s
+  retries: 12
+  start_period: 15s
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-tca}
+      POSTGRES_USER: ${POSTGRES_USER:-tca}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tca_local_development_only}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks: [application]
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    networks: [application]
+
+  api-dev:
+    profiles: [development]
+    build:
+      context: ./backend
+      target: development
+    restart: unless-stopped
+    environment: *backend-environment
+    volumes:
+      - ./backend/src:/app/src
+    depends_on: *backend-dependencies
+    healthcheck: *api-healthcheck
+    networks: [application]
+
+  worker-dev:
+    profiles: [development]
+    build:
+      context: ./backend
+      target: development
+    restart: unless-stopped
+    command: ["celery", "-A", "tca_web.worker:celery_app", "worker", "--loglevel=INFO"]
+    environment: *backend-environment
+    volumes:
+      - ./backend/src:/app/src
+    depends_on: *backend-dependencies
+    healthcheck:
+      test: ["CMD", "celery", "-A", "tca_web.worker:celery_app", "inspect", "ping", "--timeout=5"]
+      interval: 15s
+      timeout: 10s
+      retries: 6
+      start_period: 20s
+    networks: [application]
+
+  scheduler-dev:
+    profiles: [development]
+    build:
+      context: ./backend
+      target: development
+    restart: unless-stopped
+    command:
+      - celery
+      - -A
+      - tca_web.worker:celery_app
+      - beat
+      - --loglevel=INFO
+      - --pidfile=/tmp/celerybeat.pid
+      - --schedule=/tmp/celerybeat-schedule
+    environment: *backend-environment
+    volumes:
+      - ./backend/src:/app/src
+      - scheduler-data-dev:/tmp
+    depends_on: *backend-dependencies
+    healthcheck:
+      test: ["CMD-SHELL", "test -s /tmp/celerybeat.pid && kill -0 $$(cat /tmp/celerybeat.pid)"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    networks: [application]
+
+  frontend-dev:
+    profiles: [development]
+    build:
+      context: ./frontend
+      target: development
+    restart: unless-stopped
+    volumes:
+      - ./frontend:/app
+      - frontend-node-modules:/app/node_modules
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:5173').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    networks: [application]
+
+  proxy-dev:
+    profiles: [development]
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    ports:
+      - "${TCA_PORT:-8080}:8080"
+    volumes:
+      - ./deploy/Caddyfile.development:/etc/caddy/Caddyfile:ro
+    depends_on:
+      api-dev:
+        condition: service_healthy
+      frontend-dev:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/api/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks: [application]
+
+  api:
+    profiles: [production]
+    build:
+      context: ./backend
+      target: production
+    restart: unless-stopped
+    environment: *backend-environment
+    depends_on: *backend-dependencies
+    healthcheck: *api-healthcheck
+    networks: [application]
+
+  worker:
+    profiles: [production]
+    build:
+      context: ./backend
+      target: production
+    restart: unless-stopped
+    command: ["celery", "-A", "tca_web.worker:celery_app", "worker", "--loglevel=INFO"]
+    environment: *backend-environment
+    depends_on: *backend-dependencies
+    healthcheck:
+      test: ["CMD", "celery", "-A", "tca_web.worker:celery_app", "inspect", "ping", "--timeout=5"]
+      interval: 15s
+      timeout: 10s
+      retries: 6
+      start_period: 20s
+    networks: [application]
+
+  scheduler:
+    profiles: [production]
+    build:
+      context: ./backend
+      target: production
+    restart: unless-stopped
+    command:
+      - celery
+      - -A
+      - tca_web.worker:celery_app
+      - beat
+      - --loglevel=INFO
+      - --pidfile=/tmp/celerybeat.pid
+      - --schedule=/tmp/celerybeat-schedule
+    environment: *backend-environment
+    volumes:
+      - scheduler-data:/tmp
+    depends_on: *backend-dependencies
+    healthcheck:
+      test: ["CMD-SHELL", "test -s /tmp/celerybeat.pid && kill -0 $$(cat /tmp/celerybeat.pid)"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    networks: [application]
+
+  frontend:
+    profiles: [production]
+    build:
+      context: ./frontend
+      target: production
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks: [application]
+
+  proxy:
+    profiles: [production]
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    ports:
+      - "${TCA_PORT:-8080}:8080"
+    volumes:
+      - ./deploy/Caddyfile.production:/etc/caddy/Caddyfile:ro
+    depends_on:
+      api:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/api/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks: [application]
+
+networks:
+  application:
+
+volumes:
+  postgres-data:
+  redis-data:
+  scheduler-data:
+  scheduler-data-dev:
+  frontend-node-modules:
