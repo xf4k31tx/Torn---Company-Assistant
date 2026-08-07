@@ -37,3 +37,24 @@ def test_legacy_oauth_file_path_is_removed_on_save(monkeypatch):
     settings.save()
 
     assert "google_oauth_client_file" not in stored["settings"]
+
+
+def test_scheduled_collection_preferences_round_trip(monkeypatch):
+    from app.config import Settings
+
+    stored = {}
+    monkeypatch.setattr("app.config.secure_storage.get", lambda *_args: stored)
+    monkeypatch.setattr(
+        "app.config.secure_storage.set",
+        lambda _key, value: stored.update(value),
+    )
+    settings = Settings(
+        scheduled_collection_enabled=True,
+        scheduled_company_names=["A", "B"],
+        scheduled_wake_computer=True,
+    )
+    settings.save()
+    loaded = Settings.load()
+    assert loaded.scheduled_collection_enabled is True
+    assert loaded.scheduled_company_names == ["A", "B"]
+    assert loaded.scheduled_wake_computer is True

@@ -51,6 +51,7 @@ class MockTornAPI:
             "get_company_stock_v2": None,
             "get_company_timestamp_v2": None,
             "get_company_listings": None,
+            "fetch_url": None,
             "check_key_info": None,
         }
 
@@ -107,16 +108,72 @@ class MockTornAPI:
     def get_company_listings(self, company_type_id: int, offset: int = 0, limit: int = 100) -> dict:
         self._record("get_company_listings", company_type_id, offset, limit)
         self._raise_if_error("get_company_listings")
-        # Real pagination: only return companies within [offset, offset+limit).
-        # The mock fixture has 3 companies total, so a single page covers it
-        # for the default limit=100 - this still exercises the collector's
-        # pagination loop-termination logic (offset >= total, or empty batch).
-        full = self._data["get_company_listings"]["response"]
-        companies = full["companies"][offset:offset + limit]
+        # Combine both fixture "pages" into one 14-company source list and
+        # genuinely slice by offset/limit, so get_all_company_listings'
+        # pagination loop is exercised against real paging behavior rather
+        # than a single hardcoded page. _metadata.links.next deliberately
+        # reproduces the CONFIRMED LIVE TORN BUG (observed 2026-08-05): the
+        # real API's next link for this endpoint omits the /{type_id} path
+        # segment entirely (".../v2/company/companies?..." instead of
+        # ".../v2/company/{type_id}/companies?..."), which is exactly what
+        # TornAPI.get_all_company_listings must defend against by reissuing
+        # through get_company_listings() rather than following the link's
+        # path - see that method's docstring.
+        all_companies = (
+            self._data["get_company_listings"]["response"]["companies"]
+            + self._data["get_company_listings_page2"]["response"]["companies"]
+        )
+        page = all_companies[offset:offset + limit]
+        next_offset = offset + limit
+        has_more = next_offset < len(all_companies)
         return {
-            "companies": copy.deepcopy(companies),
-            "_metadata": {**full["_metadata"], "offset": offset, "limit": limit},
+            "companies": copy.deepcopy(page),
+            "companies_timestamp": 1776099900,
+            "companies_delay": 3600,
+            "_metadata": {
+                "links": {
+                    "next": (
+                        f"https://api.torn.com/v2/company/companies?limit={limit}&offset={next_offset}"
+                        if has_more else None
+                    ),
+                    "prev": None,
+                },
+                "total": len(all_companies),
+            },
         }
+
+    def fetch_url(self, url: str) -> dict:
+        self._record("fetch_url", url)
+        self._raise_if_error("fetch_url")
+        raise RuntimeError(
+            f"MockTornAPI.fetch_url: no canned response configured for URL {url!r} - "
+            "get_all_company_listings should no longer call fetch_url for this endpoint's "
+            "pagination (see its docstring re: the confirmed live typeId-missing-from-next bug); "
+            "if this fires, a real regression re-introduced trusting the raw next link."
+        )
+
+    def get_all_company_listings(self, company_type_id: int, page_size: int = 100) -> list[dict]:
+        """Mirrors the real (bug-fixed) TornAPI.get_all_company_listings
+        exactly: reissues each subsequent page through get_company_listings
+        with offset/limit parsed out of _metadata.links.next, rather than
+        GETting that (confirmed-buggy, missing-typeId) link directly - so
+        collector-level tests genuinely exercise the same fix production
+        code takes, not a shortcut."""
+        import urllib.parse
+        self._record("get_all_company_listings", company_type_id, page_size)
+        all_companies: list[dict] = []
+        resp = self.get_company_listings(company_type_id, limit=page_size)
+        while True:
+            batch = resp.get("companies", []) or []
+            all_companies.extend(batch)
+            next_url = ((resp.get("_metadata") or {}).get("links") or {}).get("next")
+            if not next_url or not batch:
+                break
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(next_url).query)
+            next_offset = int((query.get("offset") or [len(all_companies)])[0])
+            next_limit = int((query.get("limit") or [page_size])[0])
+            resp = self.get_company_listings(company_type_id, offset=next_offset, limit=next_limit)
+        return all_companies
 
     def check_key_info(self) -> dict:
         self._record("check_key_info")

@@ -65,14 +65,17 @@ def _authorization_params(pick_sheet: bool) -> dict:
 def _client_config_path() -> Path:
     # 1. Check if running frozen inside a standalone build
     if getattr(sys, "frozen", False):
-        # Nuitka unpacks bundled files directly into the directory containing the code modules
+        # 1a. PyInstaller bundle root
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            meipass_path = Path(meipass) / _BUNDLED_CLIENT_RESOURCE
+            if meipass_path.is_file():
+                return meipass_path
+        # 1b. Nuitka unpacks bundled files directly into the directory containing the code modules
         bundle_root = Path(__file__).resolve().parent
-        
-        # Look for the exact filename bundled by Nuitka
         path = bundle_root / "client_secret.json"
         if path.is_file():
             return path
-            
         raise RuntimeError("This production build is missing its internal Google OAuth configuration.")
 
     # 2. Local fallback branch for your standard development workflow
@@ -126,6 +129,7 @@ def _run_local_flow(pick_sheet: bool) -> tuple[Credentials, list[str]]:
     finally:
         server.server_close()
     picked = [value for value in query.get("picked_file_ids", [""])[0].split(",") if value]
+    # pyrefly: ignore [bad-return]
     return flow.credentials, picked
 
 

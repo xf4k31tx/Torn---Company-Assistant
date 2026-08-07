@@ -1,22 +1,5 @@
 """
 Desktop GUI for the Knotty Oil Tracker.
-
-Tabs (nested structure as of Phase 1):
-  Overview                              - latest company-level snapshot + a "Run Snapshot Now" button
-  Employees (parent)
-    Employee Overview                   - current roster with Torn's per-employee effectiveness breakdown
-    Position Efficiency (parent)
-      Base Effectiveness Projections    - Tornstats work-stats projections per employee per position
-      Total Effectiveness Projections   - placeholder; wired with real data in Phase 2
-  Stock & Profit Trends (parent)
-    Stock                               - latest stock snapshot + a sold-worth trend chart
-    Company Trends                      - pick any Company_History metric and chart it over time
-  Settings                              - encrypted local API keys / Google OAuth / sheet target
-
-All data is read straight from the Google Sheet (via SheetsClient), so the
-GUI is safe to close and reopen without losing anything - the Sheet is the
-source of truth. "Run Snapshot Now" triggers app.collector.Collector in a
-background thread so the UI never freezes on network calls.
 """
 
 from __future__ import annotations
@@ -30,9 +13,8 @@ import os
 import tkinter as tk
 import docx
 from pathlib import Path
-# Identify the root directory path 
+
 project_root = str(Path(__file__).resolve().parent.parent)
-# Append the root path index to Python's environment lookup tree if not already present
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
@@ -48,50 +30,136 @@ from app.collector import Collector
 from app.config import Settings
 from app.sheets_client import SheetsClient
 from app.google_auth import authorize as authorize_google, pick_google_sheet
+from app.scheduled_collection import run_scheduled_collection
+from app.windows_scheduler import install_task, remove_task, repair_task, task_status
 from app import companies as companies_mod
 
-# Stores only window size, position, and maximized state.
-# API keys and other sensitive settings remain in the encrypted Settings file.
 WINDOW_STATE_FILE = Path.home() / ".torn_company_assistant_window.json"
+CLICK_FOR_MORE_INFO_SUFFIX = " (click for more info)"
 
-# Fields that represent Torn dollars and should render as "$1,234,567" rather
-# than a bare number. Keyed by the sheet-tab they come from.
+
+def calculate_popup_geometry(
+    parent_x: int,
+    parent_y: int,
+    parent_width: int,
+    parent_height: int,
+    popup_width: int,
+    popup_height: int,
+    margin: int = 12,
+) -> tuple[int, int, int, int]:
+    available_width = max(1, parent_width - margin * 2)
+    available_height = max(1, parent_height - margin * 2)
+    width = min(max(1, popup_width), available_width)
+    height = min(max(1, popup_height), available_height)
+    x = parent_x + margin + (available_width - width) // 2
+    y = parent_y + margin + (available_height - height) // 2
+    return width, height, x, y
+
+
+def place_popup_within_parent(
+    popup,
+    parent,
+    preferred_width: int | None = None,
+    preferred_height: int | None = None,
+):
+    parent.update_idletasks()
+    popup.update_idletasks()
+    width, height, x, y = calculate_popup_geometry(
+        parent.winfo_rootx(),
+        parent.winfo_rooty(),
+        max(1, parent.winfo_width()),
+        max(1, parent.winfo_height()),
+        preferred_width or popup.winfo_reqwidth(),
+        preferred_height or popup.winfo_reqheight(),
+    )
+    x_part = f"+{x}" if x >= 0 else str(x)
+    y_part = f"+{y}" if y >= 0 else str(y)
+    popup.geometry(f"{width}x{height}{x_part}{y_part}")
+
+
+def open_single_instance_popup(owner, key: str, factory):
+    registry = getattr(owner, "_open_popup_windows", None)
+    if registry is None:
+        registry = {}
+        owner._open_popup_windows = registry
+
+    existing = registry.get(key)
+    if existing is not None:
+        try:
+            if existing.winfo_exists():
+                existing.deiconify()
+                existing.lift()
+                existing.focus_force()
+                return existing
+        except (AttributeError, tk.TclError):
+            pass
+        registry.pop(key, None)
+
+    popup = factory()
+    if popup is None:
+        return None
+    registry[key] = popup
+
+    def forget_popup(event=None):
+        if event is not None and event.widget is not popup:
+            return
+        if registry.get(key) is popup:
+            registry.pop(key, None)
+
+    popup.bind("<Destroy>", forget_popup, add="+")
+    return popup
+
+
 INTEGER_FIELDS = {
     "Stock_History": {"in_stock", "sold_amount", "created"},
 }
+
+
+def _safe_int_ts(val) -> int:
+    try:
+        return int(float(str(val).replace(",", "").strip()))
+    except (TypeError, ValueError):
+        return 0
+
+
 def format_int(value) -> str:
-    """1234 / 1234.0 -> '1,234'."""
     try:
         return f"{int(round(float(value))):,}"
     except (TypeError, ValueError):
         return str(value)
     
+
 MONEY_FIELDS = {
     "Company_History": {
         "daily_income", "daily_profit", "weekly_income", "weekly_profit", "company_funds",
         "advertising_budget", "total_wage", "daily_stockcost",
         "avg_daily_profit_7day", "avg_daily_income_7day",
+        "monthly_income", "monthly_profit", "income_to_reach_10_star",
+        "income_buffer_before_9_star", "income_to_reach_next_star",
+        "required_weekly_income_to_star_up", "income_to_drop_to_previous_star",
+        "rolling_7day_income",
+        "rolling_7day_change", "observed_drop_buffer", "observed_next_star_gap",
     },
+    "Star_Income_Summary": {"minimum", "p10", "median", "p90", "maximum"},
     "Employees": {"wage"},
     "Employee_Effectiveness": {"wage"},
     "Stock_History": {"cost", "price", "sold_worth", "delta_sold_worth"},
+    "Company_Rankings": {"daily_income", "weekly_income"},
 }
 
-# Fields that are unix timestamps and should render as a readable date/time
-# rather than a raw epoch number. Keyed by the sheet-tab they come from.
+PERCENT_FIELDS = {
+    "Company_History": {"observed_range_position_percent"},
+}
+
 TIMESTAMP_FIELDS = {
     "Employees": {"last_action_ts"},
     "Employee_Effectiveness": {"last_action_ts"},
 }
 
-# Fields that are a delta vs. the previous snapshot and should render with an
-# explicit +/- sign so a change is obvious at a glance. Keyed by sheet-tab.
 SIGNED_FIELDS = {
     "Stock_History": {"delta_in_stock", "delta_sold_amount"},
 }
 
-# Fields that are TRUE/FALSE flag columns and should render as a plain-
-# language yes/blank rather than the raw sheet string. Keyed by sheet-tab.
 BOOL_FIELDS = {
     "Employee_Effectiveness": {"misplaced_flag", "wage_efficiency_flag"},
     "Stock_History": {"stockout_soon"},
@@ -99,7 +167,6 @@ BOOL_FIELDS = {
 
 
 def format_money(value) -> str:
-    """'1234567' / '1234567.5' -> '$1,234,568' (whole dollars, comma-grouped)."""
     try:
         amount = float(value)
     except (TypeError, ValueError):
@@ -108,9 +175,92 @@ def format_money(value) -> str:
     return f"{sign}${abs(amount):,.0f}"
 
 
+def format_star_progress(income_to_reach, income_to_drop, current_star=None) -> str:
+    def _number(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    reach = _number(income_to_reach)
+    drop = _number(income_to_drop)
+    try:
+        stars = int(float(current_star))
+    except (TypeError, ValueError):
+        stars = None
+
+    if reach is not None and reach > 0:
+        return f"Need {format_money(reach)}/wk more"
+    if reach == 0 and stars is not None and stars < 10:
+        return f"In the projected {stars + 1}-star income range"
+    if drop is not None and stars is not None and stars > 1:
+        return f"{format_money(drop)}/wk buffer before {stars - 1}-star"
+    return "Not enough data yet"
+
+
+def derive_star_progress(ranking_rows: list[dict], summary_rows: list[dict]) -> dict:
+    own = next((row for row in ranking_rows if _is_own_company_row(row)), None)
+    if not own:
+        return {}
+    try:
+        stars = int(float(own.get("rating")))
+        income = float(str(own.get("weekly_income")).replace(",", ""))
+    except (TypeError, ValueError):
+        return {}
+
+    by_star = {}
+    for row in summary_rows:
+        try:
+            by_star[int(float(row.get("stars")))] = row
+        except (TypeError, ValueError):
+            continue
+
+    def amount(row, key):
+        if not row:
+            return None
+        try:
+            return float(str(row.get(key)).replace(",", ""))
+        except (TypeError, ValueError):
+            return None
+
+    current_range = by_star.get(stars)
+    current_minimum = amount(current_range, "minimum")
+    current_maximum = amount(current_range, "maximum")
+    next_minimum = amount(by_star.get(stars + 1), "minimum")
+    previous_maximum = amount(by_star.get(stars - 1), "maximum")
+    result = {
+        "rating": own.get("rating"),
+        "weekly_income": income,
+    }
+    if by_star.get(10):
+        result["star_10_count"] = by_star[10].get("total_count", "")
+    if (
+        current_minimum is not None
+        and current_maximum is not None
+        and current_maximum > current_minimum
+    ):
+        result["observed_range_position_percent"] = max(
+            0.0,
+            min(
+                100.0,
+                (income - current_minimum)
+                / (current_maximum - current_minimum)
+                * 100,
+            ),
+        )
+    if next_minimum is not None:
+        gap = max(0.0, next_minimum - income)
+        result["required_weekly_income_to_star_up"] = next_minimum
+        result["income_to_reach_next_star"] = gap
+        result["observed_next_star_gap"] = gap
+    if previous_maximum is not None:
+        buffer = max(0.0, income - previous_maximum)
+        result["income_to_drop_to_previous_star"] = buffer
+        result["observed_drop_buffer"] = buffer
+    return result
+
+
 def format_timestamp(value) -> str:
-    """Unix timestamp (int/str/float) -> 'YYYY-MM-DD HH:MM UTC'. Falls back
-    to the raw value as-is if it isn't a valid number (e.g. blank cell)."""
     try:
         ts = int(float(value))
     except (TypeError, ValueError):
@@ -120,10 +270,19 @@ def format_timestamp(value) -> str:
     return datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
+def format_data_freshness(value, now: int | None = None) -> str:
+    try:
+        ts = int(float(value))
+    except (TypeError, ValueError):
+        return "Unknown"
+    age = max(0, int(now or time.time()) - ts)
+    days = age // 86400
+    if days == 0:
+        return "Current"
+    return f"{days} day{'s' if days != 1 else ''} stale"
+
+
 def format_time_since(value) -> str:
-    """Unix timestamp -> human-readable elapsed time, e.g. '2d 4h ago',
-    '5h 12m ago', '3m ago', 'just now'. Computed against wall-clock time at
-    render time, so this updates naturally every time the tab refreshes."""
     try:
         ts = int(float(value))
     except (TypeError, ValueError):
@@ -144,26 +303,19 @@ def format_time_since(value) -> str:
         return f"{hours}h {minutes}m ago"
     return f"{minutes}m ago"
 
+
 def get_legal_text(relative_subpath: str) -> str:
-    """
-    Locates and extracts text paragraphs from a .docx Word document.
-    Accurately preserves the nested layout across loose script runs and compiled bundles.
-    """
     if getattr(sys, "frozen", False):
-        # Target Nuitka's true internal temp extraction root directory
         try:
             main_module = sys.modules['__main__']
             bundle_root = Path(main_module.__file__).resolve().parent
         except Exception:
             bundle_root = Path(sys.executable).parent
     else:
-        # Standard local development folder tracking (shifts up from gui/)
         bundle_root = Path(__file__).resolve().parent.parent
 
-    # Construct the path to your structured asset target
     target_path = bundle_root / relative_subpath
 
-    # Debug fallback check showing the absolute path tried if a crash occurs
     if not target_path.is_file():
         return f"Error: [Internal Path: {target_path}] - {relative_subpath} missing from bundle."
         
@@ -178,19 +330,6 @@ def get_legal_text(relative_subpath: str) -> str:
 
 
 def build_employee_info_card_fields(record: dict | None) -> list[tuple[str, str]]:
-    """Employee_Effectiveness row -> ordered (label, formatted value) pairs
-    for the Position Efficiency tab's employee info card popup. Pure and
-    Tk-independent so it's testable without a real widget. record is None
-    (or {}) when the clicked employee's tId has no matching row in the
-    Employee_Effectiveness sheet (stale cache / sheet edited externally) -
-    the caller is expected to show its own "not found" message in that
-    case rather than call this with no data.
-
-    "Current Eff." reuses the same terminology/field as the Employees and
-    Position Efficiency tabs' own "Current Eff." column
-    (projected_efficiency_current_position, Tornstats' projection at the
-    employee's current position) rather than Torn's own "Work Stats Eff."
-    (effectiveness_working_stats), for consistency with the rest of the app."""
     record = record or {}
     return [
         ("Name", str(record.get("name", "") or "")),
@@ -206,8 +345,6 @@ def build_employee_info_card_fields(record: dict | None) -> list[tuple[str, str]
 
 
 def format_signed_int(value) -> str:
-    """'50' -> '+50', '-20' -> '-20', '0'/blank -> '0'. Used for day-over-day
-    deltas so an increase vs. a decrease is obvious at a glance."""
     try:
         amount = int(round(float(value)))
     except (TypeError, ValueError):
@@ -218,23 +355,151 @@ def format_signed_int(value) -> str:
 
 
 def format_bool_flag(value) -> str:
-    """Sheet TRUE/FALSE (or Python True/False) -> a plain-language marker.
-    Blank for False so a scanned column reads as "empty unless flagged"
-    rather than a wall of repeated 'No's."""
     text = str(value).strip().lower()
     return "\u26a0 Yes" if text in ("true", "1", "yes") else ""
 
 
 def pretty_label(text: str) -> str:
-    """Internal snake_case field/column name -> display label.
-    'daily_income' -> 'daily income', 'in_stock_difference' -> 'in stock difference'.
-    Data lookups always use the original underscored name; this is display-only."""
-    return text.replace("_", " ")
+    labels = {
+        "income_buffer_before_9_star": "income to drop to 9 star",
+        "income_to_reach_next_star": "income to reach next star",
+        "required_weekly_income_to_star_up": "required weekly income to star up",
+        "income_to_drop_to_previous_star": "income to drop to previous star",
+        "rolling_7day_income": "rolling 7-day income",
+        "rolling_7day_coverage": "rolling 7-day coverage",
+        "rolling_7day_change": "rolling 7-day change",
+        "observed_range_position_percent": "observed range position (%)",
+        "observed_drop_buffer": "observed drop buffer",
+        "observed_next_star_gap": "observed next-star gap",
+    }
+    return labels.get(text, text.replace("_", " "))
+
+
+FIELD_EXPLANATIONS: dict[str, str] = {
+    "effectiveness_total": (
+        "Torn's total effectiveness for this employee at their CURRENT "
+        "position - the sum of all 8 components below."
+    ),
+    "effectiveness_working_stats": (
+        "The portion of effectiveness contributed by this employee's raw "
+        "work stats alone."
+    ),
+    "effectiveness_settled_in": "Effectiveness gained from length of employment.",
+    "effectiveness_director_education": "Effectiveness gained from completed education courses.",
+    "effectiveness_addiction": "Effectiveness lost to current drug addiction level.",
+    "effectiveness_inactivity": "Effectiveness lost to recent inactivity.",
+    "effectiveness_management": "Effectiveness gained from company perks and management skill.",
+    "effectiveness_book": "Effectiveness gained from company books read.",
+    "effectiveness_merits": "Effectiveness gained from company-relevant merits.",
+    "projected_efficiency_current_position": "Tornstats' PROJECTED efficiency for raw work stats at CURRENT position.",
+    "base_effectiveness_projections": "Tornstats' work-stats-only projected efficiency for every employee at every position.",
+    "total_effectiveness_projections": "Base projection plus non-work-stats effectiveness delta applied to every position.",
+}
+
+EMPLOYEE_EFFECTIVENESS_EXPLAINED_COLUMNS = (
+    "effectiveness_total", "effectiveness_working_stats", "effectiveness_settled_in",
+    "effectiveness_director_education", "effectiveness_addiction", "effectiveness_inactivity",
+    "effectiveness_management", "effectiveness_book", "effectiveness_merits",
+    "projected_efficiency_current_position",
+)
+
+EMPLOYEE_INFO_CARD_EXPLAINED_LABELS = {
+    "Current Eff.": "projected_efficiency_current_position",
+    "Total Eff.": "effectiveness_total",
+}
+
+
+def show_field_explanation(parent, title: str, key: str):
+    text = FIELD_EXPLANATIONS.get(key, "No explanation available for this field.")
+    messagebox.showinfo(title, text, parent=parent)
+
+
+def make_info_glyph(parent, key: str, title: str | None = None):
+    display_title = title or pretty_label(key).title()
+    return tk.Button(
+        parent,
+        text="\u24d8",
+        command=lambda: show_field_explanation(parent, display_title, key),
+        relief="flat",
+        borderwidth=0,
+        font=("TkDefaultFont", 9),
+        cursor="hand2",
+        padx=2,
+        pady=0,
+    )
+
+
+def select_recent_stock_history_rows(records: list[dict], count: int = 7) -> list[dict]:
+    rows_by_name: dict[str, list[dict]] = {}
+    for row in records:
+        name = row.get("name") or ""
+        rows_by_name.setdefault(name, []).append(row)
+
+    result: list[dict] = []
+    for name in sorted(rows_by_name.keys()):
+        newest_first = sorted(
+            rows_by_name[name],
+            key=lambda r: _safe_int_ts(r.get("timestamp")),
+            reverse=True,
+        )
+        result.extend(newest_first[:count])
+    return result
+
+
+def _is_own_company_row(row: dict) -> bool:
+    return str(row.get("is_own_company", "")).strip().lower() in ("true", "1", "yes")
+
+
+def rank_neighbors_from_sheet_rows(rows: list[dict], span: int = 5) -> list[dict]:
+    ordered = sorted(rows, key=lambda r: int(r.get("rank") or 0))
+    own_index = next((i for i, r in enumerate(ordered) if _is_own_company_row(r)), None)
+    if own_index is None:
+        return []
+    start = max(0, own_index - span)
+    end = min(len(ordered), own_index + span + 1)
+    return ordered[start:end]
+
+
+COMPANY_RANKING_NUMERIC_COLUMNS = {
+    "rank", "rating", "daily_income", "weekly_income",
+}
+
+
+def company_ranking_sort_value(row: dict, column: str):
+    value = row.get(column)
+    if value in (None, ""):
+        return None
+    if column in COMPANY_RANKING_NUMERIC_COLUMNS:
+        try:
+            return float(str(value).replace(",", "").strip())
+        except (TypeError, ValueError):
+            return None
+    return str(value).strip().casefold()
+
+
+def sort_company_ranking_rows(
+    rows: list[dict], column: str, reverse: bool = False
+) -> list[dict]:
+    populated = []
+    missing = []
+    for row in rows:
+        value = company_ranking_sort_value(row, column)
+        if value is None:
+            missing.append(row)
+        else:
+            populated.append((value, row))
+    populated.sort(key=lambda item: item[0], reverse=reverse)
+    return [row for _, row in populated] + missing
 
 
 def format_field(field_name: str, value, tab: str) -> str:
     if field_name in MONEY_FIELDS.get(tab, ()):
         return format_money(value)
+    if field_name in PERCENT_FIELDS.get(tab, ()):
+        try:
+            return f"{float(value):.0f}%"
+        except (TypeError, ValueError):
+            return str(value)
     if field_name in TIMESTAMP_FIELDS.get(tab, ()):
         return format_timestamp(value)
     if field_name in SIGNED_FIELDS.get(tab, ()):
@@ -352,55 +617,6 @@ def position_efficiency_sort_value(record: dict, column: str):
         return float("-inf")
 
 
-# Work-stats-effectiveness color grading for the Position Effectiveness tab.
-# Torn/Tornstats don't publish exact color/threshold values for this anywhere
-# (checked - there's no documented spec, just "red is bad, green is good"
-# from players' own screenshots/descriptions), so this reproduces the same
-# red -> orange -> yellow -> light green -> dark green gradient the old
-# position_efficiency tab already used (matplotlib's "RdYlGn" colormap) as a set of
-# named, continuously-interpolated stops instead of a matplotlib dependency,
-# so plain tk.Label cells can use it too. 100% = exactly meets a position's
-# stat requirement; below is under-qualified, above is over-qualified.
-_EFFECTIVENESS_COLOR_STOPS = [
-    (0.0, (198, 40, 40)),      # deep red     - badly under-qualified
-    (50.0, (239, 108, 0)),     # orange
-    (70.0, (249, 199, 79)),    # yellow
-    (90.0, (156, 204, 101)),   # light green
-    (110.0, (46, 125, 50)),    # dark green   - meets/exceeds requirement
-]
-
-
-def _effectiveness_color(value):
-    """
-    Continuous gradient:
-        0   -> Red
-        50  -> Orange
-        80  -> Yellow
-        100 -> Light Green
-        120 -> Green
-        140+-> Dark Green
-    """
-    value = max(0, min(140, float(value)))
-    stops = [
-        (0,   (200,  50,  50)),   # red
-        (50,  (235, 120,  40)),   # orange
-        (80,  (245, 210,  60)),   # yellow
-        (100, (150, 220, 100)),   # light green
-        (120, ( 80, 180,  80)),   # green
-        (140, ( 30, 120,  50)),   # dark green
-    ]
-    for i in range(len(stops)-1):
-        v1, c1 = stops[i]
-        v2, c2 = stops[i+1]
-        if value <= v2:
-            t = (value - v1) / (v2 - v1)
-            r = int(c1[0] + (c2[0]-c1[0]) * t)
-            g = int(c1[1] + (c2[1]-c1[1]) * t)
-            b = int(c1[2] + (c2[2]-c1[2]) * t)
-            return f"#{r:02x}{g:02x}{b:02x}"
-    return "#1e7832"
-
-
 def _readable_text_color(bg):
     bg = bg.lstrip("#")
     r = int(bg[0:2], 16)
@@ -410,10 +626,6 @@ def _readable_text_color(bg):
     return "#000000" if brightness > 150 else "#ffffff"
 
 
-# Full Employees table column set, in order: (header, row_key). Headers use
-# \n for explicit line breaks - ttk.Treeview headings render multi-line
-# text natively (given the 'clam' theme - see launch()), unlike cell
-# values, which Treeview always clips to one line.
 EMPLOYEE_TABLE_COLUMNS = [
     ("Name", "name"),
     ("Position", "current_position"),
@@ -443,10 +655,6 @@ EMPLOYEE_TABLE_COLUMNS = [
     ("tId", "tId"),
 ]
 
-# Shown by default; the rest are available via the "Columns..." toggle.
-# Chosen to mirror the old standalone Employee Calculator's default view
-# plus the new Phase 4 misplaced/wage-outlier flags, without overwhelming
-# a first-time user with all 26 columns at once.
 DEFAULT_VISIBLE_EMPLOYEE_COLUMNS = {
     "tId", "name", "wage", "current_position", "projected_efficiency_current_position",
     "assigned_position", "assigned_efficiency", "effectiveness_settled_in", "effectiveness_director_education",
@@ -465,14 +673,6 @@ def employee_position_is_locked(row, locked_employee_ids):
 
 
 class ColumnPickerDialog(tk.Toplevel):
-    """
-    Modal dialog for choosing which Employees columns are visible and
-    arranging their display order.
-
-    self.result is the ordered list of selected column keys, or None when
-    cancelled.
-    """
-
     def __init__(self, master, visible_keys):
         super().__init__(master)
         self.title("Choose and Reorder Columns")
@@ -488,13 +688,11 @@ class ColumnPickerDialog(tk.Toplevel):
 
         all_keys = [key for _, key in EMPLOYEE_TABLE_COLUMNS]
 
-        # Keep the currently saved/displayed order first.
         self.column_order = [
             key for key in visible_keys
             if key in self.column_labels
         ]
 
-        # Add currently hidden columns after the visible columns.
         self.column_order.extend(
             key for key in all_keys
             if key not in self.column_order
@@ -591,6 +789,8 @@ class ColumnPickerDialog(tk.Toplevel):
             command=self.destroy,
         ).pack(side="left", padx=4)
 
+        place_popup_within_parent(self, master)
+
     def _refresh_list(self, selected_index=None):
         self.column_list.delete(0, "end")
 
@@ -666,21 +866,6 @@ class ColumnPickerDialog(tk.Toplevel):
 
 
 class PositionCapacitiesDialog(tk.Toplevel):
-    """
-    Modal dialog configuring how "Assigned Position" fills seats for one
-    company: each position's max headcount, and the priority order
-    positions are filled in. Positions are listed top-to-bottom in current
-    priority order (top = filled first, with the best remaining candidates,
-    before moving down the list); use the up/down buttons to reorder.
-    Leaving a Max Qty field blank means "no cap" for that position.
-
-    self.result ends up as:
-      - {"capacities": {position_name: int}, "priority_order": [position_name, ...]}
-        - user saved settings, run priority-constrained
-      - "global" - user chose to skip capacities/priority entirely
-      - None     - user cancelled
-    """
-
     def __init__(self, master, position_names, existing_capacities, existing_priority_order=None):
         super().__init__(master)
         self.title("Position Capacities && Priority")
@@ -717,6 +902,8 @@ class PositionCapacitiesDialog(tk.Toplevel):
         ttk.Button(button_row, text="Save && Use Priorities", command=self._save_and_run).pack(side="left", padx=4)
         ttk.Button(button_row, text="Use Global Projection Only", command=self._run_global).pack(side="left", padx=4)
         ttk.Button(button_row, text="Cancel", command=self._cancel).pack(side="left", padx=4)
+
+        place_popup_within_parent(self, master)
 
     def _render_rows(self):
         for widget in self.rows_frame.winfo_children():
@@ -779,24 +966,6 @@ class PositionCapacitiesDialog(tk.Toplevel):
 
 
 class PositionVisibilityDialog(tk.Toplevel):
-    """Modal checklist for which positions show as columns on the Position
-    Effectiveness grid, plus a free-text way to add a position by hand.
-
-    This exists because there's no fully reliable automatic source for "every
-    position this company type has" - Tornstats' own /efficiency response is
-    the best one available, but it can omit a real position outright (seen
-    firsthand: it never returned "Inspector" for this Oil Rig company even
-    though it's a real, selectable position in-game). Rather than silently
-    dropping a position no automatic source reports, this hands control to
-    the user: check/uncheck what's already been detected, or type in
-    anything missing so it always shows going forward (its cells just read
-    "n/a" instead of a percentage until/unless a projection for it is ever
-    found).
-
-    self.result ends up as {"visible": [position_name, ...]} - every
-    position name known (detected or manually added) that's currently
-    checked - or None if cancelled."""
-
     def __init__(self, master, all_positions, hidden_positions):
         super().__init__(master)
         self.title("Configure Positions")
@@ -813,8 +982,8 @@ class PositionVisibilityDialog(tk.Toplevel):
             self,
             text=(
                 "Choose which positions appear as columns on the Position\n"
-                "Effectiveness grid. Don't see one that should be here (e.g. a\n"
-                "position Tornstats doesn't report)? Add it by name below."
+                "Effectiveness grid. Don't see one that should be here?\n"
+                "Add it by name below."
             ),
             justify="left",
         ).pack(anchor="w", padx=12, pady=(12, 8))
@@ -837,6 +1006,8 @@ class PositionVisibilityDialog(tk.Toplevel):
         ttk.Button(btn_row, text="Select All", command=self._select_all).pack(side="left", padx=4)
         ttk.Button(btn_row, text="Save", command=self._save).pack(side="left", padx=4)
         ttk.Button(btn_row, text="Cancel", command=self.destroy).pack(side="left", padx=4)
+
+        place_popup_within_parent(self, master)
 
     def _render_rows(self):
         for widget in self.rows_frame.winfo_children():
@@ -866,22 +1037,6 @@ class PositionVisibilityDialog(tk.Toplevel):
 
 
 class EmployeeInfoCard(tk.Toplevel):
-    """
-    Small popup shown when a Name cell is clicked on the Position Efficiency
-    tab: Name, ID (tId, labeled "ID" in the GUI only), Last Online, Work
-    Stats (Manual Labor/Endurance/Intelligence), Current Position, Current
-    Eff., and Total Eff. for that one employee.
-
-    Non-modal by design (no grab_set()) - clicking another employee's Name
-    cell while a card is already open just opens/updates a card rather than
-    being blocked, so multiple employees can be looked at side by side.
-
-    record is the raw Employee_Effectiveness row dict for the employee, or
-    None if the lookup by tId came up empty (stale cache / sheet edited
-    externally since the last Position Efficiency refresh) - a short
-    explanatory message is shown instead of a broken/blank card in that case.
-    """
-
     def __init__(self, master, record: dict | None):
         super().__init__(master)
         self.resizable(False, False)
@@ -904,15 +1059,9 @@ class EmployeeInfoCard(tk.Toplevel):
                 wraplength=280,
             ).pack(anchor="w")
             ttk.Button(content, text="Close", command=self.destroy).pack(pady=(16, 0))
-            self._center_on_screen()
+            self._place_within_parent()
             return
 
-        # A scrollable body - the canvas/window are sized to the body's own
-        # required size below (after the fields are laid out), rather than
-        # a fixed guessed box, so there's no empty space next to the labels.
-        # Scrolling only actually engages if the content ever outgrows
-        # MAX_BODY_HEIGHT - future-proofing for more fields being added
-        # later while keeping today's short field list compact.
         MAX_BODY_HEIGHT = 260
         canvas = tk.Canvas(content, highlightthickness=0)
         scrollbar = ttk.Scrollbar(content, orient="vertical", command=canvas.yview)
@@ -923,15 +1072,20 @@ class EmployeeInfoCard(tk.Toplevel):
         canvas.pack(side="left", fill="both", expand=True)
 
         for row_index, (label, value) in enumerate(build_employee_info_card_fields(record)):
-            ttk.Label(body, text=label, font=("Segoe UI", 9, "bold")).grid(
-                row=row_index, column=0, sticky="w", padx=(0, 12), pady=3
-            )
+            explanation_key = EMPLOYEE_INFO_CARD_EXPLAINED_LABELS.get(label)
+            if explanation_key is not None:
+                label_cell = ttk.Frame(body)
+                ttk.Label(label_cell, text=label, font=("Segoe UI", 9, "bold")).pack(side="left")
+                make_info_glyph(label_cell, explanation_key, title=label).pack(side="left", padx=(2, 0))
+                label_cell.grid(row=row_index, column=0, sticky="w", padx=(0, 12), pady=3)
+            else:
+                ttk.Label(body, text=label, font=("Segoe UI", 9, "bold")).grid(
+                    row=row_index, column=0, sticky="w", padx=(0, 12), pady=3
+                )
             ttk.Label(body, text=value).grid(row=row_index, column=1, sticky="w", pady=3)
 
         ttk.Button(content, text="Close", command=self.destroy).pack(pady=(12, 0))
 
-        # Now that the fields are laid out, size the canvas/scroll window to
-        # match the body's actual required size instead of a hardcoded box.
         body.update_idletasks()
         body_width = body.winfo_reqwidth()
         body_height = body.winfo_reqheight()
@@ -940,19 +1094,203 @@ class EmployeeInfoCard(tk.Toplevel):
         if body_height > MAX_BODY_HEIGHT:
             scrollbar.pack(side="right", fill="y")
 
-        self._center_on_screen()
+        self._place_within_parent()
 
-    def _center_on_screen(self):
-        self.update_idletasks()
-        # winfo_width()/height() report 1 until the window is actually
-        # mapped by the OS window manager, which update_idletasks() alone
-        # doesn't guarantee - the requested size is reliable regardless of
-        # mapping state, so use that for the centering math instead.
-        width = self.winfo_reqwidth()
-        height = self.winfo_reqheight()
-        x = (self.winfo_screenwidth() - width) // 2
-        y = (self.winfo_screenheight() - height) // 2
-        self.geometry(f"+{x}+{y}")
+    def _place_within_parent(self):
+        place_popup_within_parent(self, self.master)
+
+
+class HealthScoreNeighborsCard(tk.Toplevel):
+    COLUMNS = ("rank", "name", "rating", "daily_income", "weekly_income")
+    LABELS = {
+        "rank": "Rank", "name": "Name", "rating": "Rating",
+        "daily_income": "Daily Income", "weekly_income": "Weekly Income",
+    }
+
+    def __init__(self, master, neighbor_rows: list[dict]):
+        super().__init__(master)
+        self.resizable(False, False)
+        self.transient(master)
+        self.title("Company Ranking Neighbors")
+
+        content = ttk.Frame(self, padding=16)
+        content.pack(fill="both", expand=True)
+
+        if not neighbor_rows:
+            ttk.Label(
+                content,
+                text=(
+                    "No ranking data found for your company yet.\n"
+                    "Try Refresh from Sheet or Run Snapshot Now."
+                ),
+                justify="left",
+                wraplength=280,
+            ).pack(anchor="w")
+            ttk.Button(content, text="Close", command=self.destroy).pack(pady=(16, 0))
+            self._place_within_parent()
+            return
+
+        body = ttk.Frame(content)
+        body.pack()
+
+        for col_index, column in enumerate(self.COLUMNS):
+            ttk.Label(body, text=self.LABELS[column], font=("Segoe UI", 9, "bold")).grid(
+                row=0, column=col_index, sticky="w", padx=(0, 12), pady=(0, 4)
+            )
+
+        for row_index, row in enumerate(neighbor_rows, start=1):
+            is_own = _is_own_company_row(row)
+            font = ("Segoe UI", 9, "bold") if is_own else ("Segoe UI", 9)
+            for col_index, column in enumerate(self.COLUMNS):
+                value = row.get(column, "")
+                if column in ("daily_income", "weekly_income"):
+                    value = format_money(value)
+                ttk.Label(body, text=value, font=font).grid(
+                    row=row_index, column=col_index, sticky="w", padx=(0, 12), pady=2
+                )
+
+        ttk.Button(content, text="Close", command=self.destroy).pack(pady=(12, 0))
+        self._place_within_parent()
+
+    def _place_within_parent(self):
+        place_popup_within_parent(self, self.master)
+
+
+class StarIncomeSummaryCard(tk.Toplevel):
+    COLUMNS = (
+        "stars", "total_count", "minimum", "median", "maximum",
+        "coverage", "freshness", "updated_at",
+    )
+    LABELS = {
+        "stars": "Star Level",
+        "total_count": "Company Count",
+        "minimum": "Minimum Weekly Income",
+        "median": "Median Weekly Income",
+        "maximum": "Top Performer Weekly Income",
+        "coverage": "Companies Included",
+        "freshness": "Data Status",
+        "updated_at": "Last Updated (UTC)",
+    }
+    MONEY_COLUMNS = {"minimum", "median", "maximum"}
+    COLUMN_GUIDE = (
+        "Star Level: Projected star band represented by the row.\n\n"
+        "Company Count: Number of companies assigned to that band.\n\n"
+        "Minimum Weekly Income: Weekly Income at the final slot in the band. "
+        "This is the income target used for promotion into that star level.\n\n"
+        "Median Weekly Income: Middle Weekly Income among companies assigned "
+        "to the band.\n\n"
+        "Top Performer Weekly Income: Highest Weekly Income assigned to the "
+        "band. For the level below a company, this is the competing income "
+        "used when calculating its demotion buffer.\n\n"
+        "Companies Included: Companies with usable Weekly Income data versus "
+        "the total company count.\n\n"
+        "Data Status and Last Updated: Whether the values are current and the "
+        "UTC time of the latest collection."
+    )
+
+    def __init__(self, master, rows: list[dict]):
+        super().__init__(master)
+        self.title("Projected Weekly Income Ranges by Star Level")
+        self.transient(master)
+        self.rows = list(rows)
+        self._descending = {}
+
+        content = ttk.Frame(self, padding=12)
+        content.pack(fill="both", expand=True)
+        ttk.Label(
+            content,
+            text=(
+                "Current star counts define fixed slot bands. Each daily 18:10 UTC "
+                "snapshot orders every same-type company by Weekly Income and fills those "
+                "slots from highest to lowest. Values are empirical indicators, not "
+                "guaranteed Torn thresholds."
+            ),
+            wraplength=1040,
+            justify="left",
+        ).pack(fill="x", pady=(0, 6))
+        ttk.Button(
+            content, text="Column Guide", command=self._show_column_guide
+        ).pack(anchor="e", pady=(0, 8))
+
+        if not self.rows:
+            ttk.Label(
+                content,
+                text="No range data yet. Run one successful snapshot to populate it.",
+            ).pack(anchor="w")
+            ttk.Button(content, text="Close", command=self.destroy).pack(pady=16)
+            place_popup_within_parent(self, master, 1180, 430)
+            return
+
+        frame = ttk.Frame(content)
+        frame.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(
+            frame, columns=self.COLUMNS, show="headings", height=14
+        )
+        yscroll = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        xscroll = ttk.Scrollbar(frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+
+        widths = {
+            "stars": 90, "total_count": 105, "minimum": 165,
+            "median": 155, "maximum": 195, "coverage": 135,
+            "freshness": 110, "updated_at": 155,
+        }
+        for column in self.COLUMNS:
+            self.tree.heading(
+                column,
+                text=self.LABELS[column],
+                command=lambda key=column: self._sort(key),
+            )
+            self.tree.column(
+                column, width=widths[column], anchor="center", stretch=False
+            )
+        self._render()
+        ttk.Button(content, text="Close", command=self.destroy).pack(pady=(8, 0))
+        place_popup_within_parent(self, master, 1180, 430)
+
+    def _show_column_guide(self):
+        messagebox.showinfo(
+            "Income Range Column Guide", self.COLUMN_GUIDE, parent=self
+        )
+
+    @staticmethod
+    def _sort_value(row: dict, column: str):
+        value = row.get(column, "")
+        try:
+            return (0, float(value))
+        except (TypeError, ValueError):
+            return (1, str(value).lower())
+
+    def _sort(self, column: str):
+        descending = not self._descending.get(column, False)
+        self._descending[column] = descending
+        self.rows.sort(
+            key=lambda row: self._sort_value(row, column),
+            reverse=descending,
+        )
+        self._render()
+
+    def _render(self):
+        self.tree.delete(*self.tree.get_children())
+        for row in self.rows:
+            values = []
+            for column in self.COLUMNS:
+                value = row.get(column, "")
+                if column in self.MONEY_COLUMNS and value not in (None, ""):
+                    value = format_money(value)
+                elif column == "coverage" and value not in (None, ""):
+                    value = str(value).replace("/", " of ", 1)
+                elif column == "updated_at" and value not in (None, ""):
+                    value = format_timestamp(value)
+                elif column == "freshness":
+                    value = format_data_freshness(row.get("updated_at"))
+                values.append(value)
+            self.tree.insert("", "end", values=values)
 
 
 class MainWindow(tk.Tk):
@@ -961,19 +1299,15 @@ class MainWindow(tk.Tk):
         self.title("Torn - Company Assistant")
 
         self.settings = Settings.load()
-        # Company settings, including API keys, are DPAPI-encrypted for this user.
         self.companies = companies_mod.load_companies()
         self._migrate_legacy_primary_company()
         self.status_var = tk.StringVar(value="Ready.")
-        # Active company selection - name of a company in self.companies.
         self.company_var = tk.StringVar(value=self.settings.last_selected_company or "")
         self.company_combos = []
 
         self._build_menu()
         self._build_layout()
 
-        # Track the most recent non-maximized geometry so it can be restored
-        # even when the application is closed while maximized.
         self._last_normal_geometry = None
 
         self._restore_window_state()
@@ -983,11 +1317,6 @@ class MainWindow(tk.Tk):
         self._refresh_all(silent=True)
 
     def _migrate_legacy_primary_company(self):
-        """One-time migration for installs from before Companies existed:
-        if the old top-level Torn key + Sheet ID are set but no company has
-        been added yet, turn them into the first company entry so existing
-        data keeps working, and clear the legacy fields so they can't be
-        confused with (or silently overwritten by) a new company later."""
         if self.companies or not (self.settings.torn_api_key and self.settings.google_sheet_id):
             return
         self.companies = [{
@@ -1000,7 +1329,7 @@ class MainWindow(tk.Tk):
         try:
             companies_mod.save_companies(self.companies)
         except Exception:
-            pass  # non-fatal - worst case the migration is retried next launch
+            pass
         self.settings.torn_api_key = ""
         self.settings.tornstats_api_key = ""
         self.settings.google_sheet_id = ""
@@ -1014,13 +1343,6 @@ class MainWindow(tk.Tk):
         )
 
     def _restore_window_state(self):
-        """
-        Restore the previous window size, position, and maximized state.
-
-        On the first run, or if the saved state cannot be read, the window
-        opens maximized. This is normal Windows maximization rather than
-        borderless fullscreen, so the user can still restore and resize it.
-        """
         self.update_idletasks()
         self.minsize(900, 600)
 
@@ -1031,7 +1353,6 @@ class MainWindow(tk.Tk):
             saved_state = None
 
         if not isinstance(saved_state, dict):
-            # First application run.
             self.after_idle(lambda: self.state("zoomed"))
             return
 
@@ -1045,14 +1366,7 @@ class MainWindow(tk.Tk):
         if saved_state.get("maximized", False):
             self.after_idle(lambda: self.state("zoomed"))
 
-
     def _set_default_window_geometry(self):
-        """
-        Set a safe fallback normal-window geometry.
-
-        This is mainly used if the saved state file exists but contains invalid
-        geometry. A true first run is opened maximized by _restore_window_state().
-        """
         screen_width = self.winfo_screenwidth()
         screen_height = self.winfo_screenheight()
 
@@ -1066,12 +1380,7 @@ class MainWindow(tk.Tk):
         self.geometry(geometry)
         self._last_normal_geometry = geometry
 
-
     def _valid_window_geometry(self, geometry):
-        """
-        Check that a saved Tk geometry string is usable and that at least part
-        of the window remains visible on the current monitor arrangement.
-        """
         if not isinstance(geometry, str):
             return False
 
@@ -1092,27 +1401,14 @@ class MainWindow(tk.Tk):
         screen_width = self.winfo_screenwidth()
         screen_height = self.winfo_screenheight()
 
-        # Keep at least 100 pixels accessible on the current display.
-        if x > screen_width - 100:
+        if x > screen_width - 100 or y > screen_height - 100:
             return False
-        if y > screen_height - 100:
-            return False
-        if x + width < 100:
-            return False
-        if y + height < 100:
+        if x + width < 100 or y + height < 100:
             return False
 
         return True
 
-
     def _remember_normal_geometry(self, event=None):
-        """
-        Remember size and position changes only while the window is in its
-        normal, resizable state.
-
-        Windows reports the maximized dimensions through geometry(), so ignoring
-        Configure events while maximized preserves the user's last normal size.
-        """
         if event is not None and event.widget is not self:
             return
 
@@ -1124,9 +1420,7 @@ class MainWindow(tk.Tk):
         except tk.TclError:
             pass
 
-
     def _save_window_state(self):
-        """Save the current normal geometry and whether the window is maximized."""
         try:
             current_state = self.state()
         except tk.TclError:
@@ -1151,67 +1445,49 @@ class MainWindow(tk.Tk):
 
         try:
             WINDOW_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-
             temporary_file = WINDOW_STATE_FILE.with_suffix(".tmp")
             with temporary_file.open("w", encoding="utf-8") as file:
                 json.dump(state_data, file, indent=2)
-
             temporary_file.replace(WINDOW_STATE_FILE)
         except OSError:
-            # Window persistence is convenient but should never prevent closing.
             pass
 
-
     def _on_window_close(self):
-        """Save the window state and then close the application."""
         self._save_window_state()
         self.destroy()
 
-    # ----------------------------------------------------------legal docs---
     def display_legal_window(self, title: str, relative_path: str):
-        """
-        Creates a standalone scrollable UI display modal window.
-        It handles reading the text content internally from the file path.
-        """
-        popup = Toplevel(self)
-        popup.title(title)
-        popup.geometry("600x500")
+        def create_popup():
+            popup = Toplevel(self)
+            popup.title(title)
+            popup.transient(self)
 
-        # Build the scrollable text widget with automated word-wrapping
-        text_box = scrolledtext.ScrolledText(
-            popup, 
-            wrap="word", 
-            font=("Segoe UI", 10), 
-            padx=15, 
-            pady=15
+            text_box = scrolledtext.ScrolledText(
+                popup,
+                wrap="word",
+                font=("Segoe UI", 10),
+                padx=15,
+                pady=15,
             )
-        text_box.pack(expand=True, fill="both")
+            text_box.pack(expand=True, fill="both")
 
-        # 🟢 FIX: Fetch the raw markdown string safely right here using the string path
-        text_content = get_legal_text(relative_path)
+            text_content = get_legal_text(relative_path)
+            text_box.insert(END, text_content)
+            text_box.config(state="disabled")
+            place_popup_within_parent(popup, self, 600, 500)
+            return popup
 
-        # Inject the text variable string directly into the active layout framework
-        text_box.insert(END, text_content)
-
-        # Freeze editing layers so application users cannot manually alter text strings
-        text_box.config(state="disabled")
+        return open_single_instance_popup(
+            self, f"legal:{relative_path}", create_popup
+        )
 
     def show_privacy(self):
-        """Passes the strict file path string to the window generator."""
-        # 🟢 FIX: Only pass the exact path string, not loaded text data
         self.display_legal_window("TCA - Privacy Policy", "legal/TCA_Privacy_Policy.docx")
 
     def show_terms(self):
-        """Passes the strict file path string to the window generator."""
-        # 🟢 FIX: Only pass the exact path string, not loaded text data
         self.display_legal_window("TCA - Terms of Service", "legal/TCA_Terms_of_Service.docx")
 
-    # --------------------------------------------------------- tree utils --
     def _make_scrollable_tree(self, parent, columns, show="headings", height=15):
-        """Wraps a Treeview with vertical + horizontal scrollbars in its own
-        frame, so content that doesn't fit the current window size is still
-        reachable by scrolling instead of requiring a manual window resize.
-        Returns (frame, tree) - pack/grid the frame, use the tree as usual."""
         frame = ttk.Frame(parent)
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
@@ -1225,11 +1501,6 @@ class MainWindow(tk.Tk):
         return frame, tree
     
     def _make_scrollable_grid(self, parent):
-        """Canvas + inner Frame with both scrollbars, for a spreadsheet-style
-        grid of arbitrary widgets. A plain ttk.Treeview can't do this - it only
-        supports whole-row tag colors, not independent per-cell backgrounds,
-        which the Position Effectiveness tab needs. Returns (frame, canvas,
-        inner) - pack/grid the frame, then .grid() widgets into inner."""
         frame = ttk.Frame(parent)
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
@@ -1256,9 +1527,6 @@ class MainWindow(tk.Tk):
             canvas.itemconfig(window_id, width=max(event.width, inner.winfo_reqwidth()))
         canvas.bind("<Configure>", _on_canvas_configure)
 
-        # Mouse wheel only scrolls this grid while the cursor is actually over
-        # it, via bind_all/unbind_all on enter/leave - a global permanent bind
-        # would hijack scrolling on every other tab's Treeview too.
         def _on_mousewheel(event):
             canvas.yview_scroll(-1 * (event.delta // 120), "units")
         canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
@@ -1290,10 +1558,6 @@ class MainWindow(tk.Tk):
         return frame, canvas
 
     def _autosize_columns(self, tree, min_width=60, max_width=420, padding=24):
-        """Fits each column's width to its widest visible content (header or
-        cell), so columns aren't wider than needed or clipping text - the
-        Excel-style 'auto-fit' behavior. Runs after every populate/sort so
-        it stays correct as data changes."""
         f = tkfont.nametofont("TkDefaultFont")
         columns = list(tree["columns"])
         has_tree_col = tree.cget("show") in ("tree headings", "tree")
@@ -1308,36 +1572,45 @@ class MainWindow(tk.Tk):
             width = max(min_width, min(widest + padding, max_width))
             tree.column(col, width=width)
 
-    # ------------------------------------------------------------- menu --
     def _build_menu(self):
         menubar = tk.Menu(self)
         file_menu = tk.Menu(menubar, tearoff=0)
         file_menu.add_command(label="Run Snapshot Now", command=self.run_snapshot)
         file_menu.add_command(label="Refresh From Sheet", command=self.refresh_from_sheet)
-        file_menu.add_command(label="TOS", command=self.show_terms)
-        file_menu.add_command(label="Privacy Policy", command=self.show_privacy)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.destroy)
         menubar.add_cascade(label="File", menu=file_menu)
+
+        legal_menu = tk.Menu(menubar, tearoff=0)
+        legal_menu.add_command(label="TOS", command=self.show_terms)
+        legal_menu.add_command(label="Privacy Policy", command=self.show_privacy)
+        menubar.add_cascade(label="Legal", menu=legal_menu)
+
         self.config(menu=menubar)
 
-    # ----------------------------------------------------------- layout --
     def _build_layout(self):
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True)
 
-        # -- Top-level tabs --
-        self.overview_tab = ttk.Frame(self.notebook)
+        self.overview_parent_tab = ttk.Frame(self.notebook)
         self.employees_parent_tab = ttk.Frame(self.notebook)
         self.stock_trends_parent_tab = ttk.Frame(self.notebook)
         self.settings_tab = ttk.Frame(self.notebook)
 
-        self.notebook.add(self.overview_tab, text="Overview")
+        self.notebook.add(self.overview_parent_tab, text="Overview")
         self.notebook.add(self.employees_parent_tab, text="Employees")
         self.notebook.add(self.stock_trends_parent_tab, text="Stock & Profit Trends")
         self.notebook.add(self.settings_tab, text="Settings")
 
-        # -- Employees sub-notebook: Employee Overview + Position Efficiency (nested) --
+        self.overview_notebook = ttk.Notebook(self.overview_parent_tab)
+        self.overview_notebook.pack(fill="both", expand=True)
+
+        self.overview_tab = ttk.Frame(self.overview_notebook)
+        self.company_rankings_tab = ttk.Frame(self.overview_notebook)
+
+        self.overview_notebook.add(self.overview_tab, text="General")
+        self.overview_notebook.add(self.company_rankings_tab, text="Company Rankings")
+
         self.employees_notebook = ttk.Notebook(self.employees_parent_tab)
         self.employees_notebook.pack(fill="both", expand=True)
 
@@ -1347,7 +1620,6 @@ class MainWindow(tk.Tk):
         self.employees_notebook.add(self.employee_overview_tab, text="Employee Overview")
         self.employees_notebook.add(self.position_efficiency_parent_tab, text="Position Efficiency")
 
-        # -- Position Efficiency sub-notebook: Base + Total Effectiveness Projections --
         self.position_efficiency_notebook = ttk.Notebook(self.position_efficiency_parent_tab)
         self.position_efficiency_notebook.pack(fill="both", expand=True)
 
@@ -1357,7 +1629,6 @@ class MainWindow(tk.Tk):
         self.position_efficiency_notebook.add(self.base_effectiveness_tab, text="Base Effectiveness Projections")
         self.position_efficiency_notebook.add(self.total_effectiveness_tab, text="Total Effectiveness Projections")
 
-        # -- Stock & Profit Trends sub-notebook: Stock + Company Trends --
         self.stock_trends_notebook = ttk.Notebook(self.stock_trends_parent_tab)
         self.stock_trends_notebook.pack(fill="both", expand=True)
 
@@ -1367,11 +1638,11 @@ class MainWindow(tk.Tk):
         self.stock_trends_notebook.add(self.stock_sub_tab, text="Stock")
         self.stock_trends_notebook.add(self.company_trends_tab, text="Company Trends")
 
-        # -- Build content for each tab --
         self._build_overview_tab()
+        self._build_company_rankings_tab()
         self._build_employees_tab()
         self._build_base_effectiveness_tab()
-        self._build_total_effectiveness_placeholder()
+        self._build_total_effectiveness_tab()
         self._build_stock_tab()
         self._build_trends_tab()
         self._build_settings_tab()
@@ -1379,7 +1650,6 @@ class MainWindow(tk.Tk):
         status_bar = ttk.Label(self, textvariable=self.status_var, anchor="w", relief="sunken")
         status_bar.pack(fill="x", side="bottom")
 
-    # --------------------------------------------------------- overview --
     def _add_company_selector(self, parent):
         combo = ttk.Combobox(
             parent,
@@ -1408,7 +1678,6 @@ class MainWindow(tk.Tk):
         ttk.Button(top, text="Run Everything", command=self.run_everything).pack(side="left")
         ttk.Button(top, text="Refresh From Sheet", command=self.refresh_from_sheet).pack(side="left", padx=6)
 
-        # Company selector: pick which configured company to view.
         selector_values = company_selector_values(self.companies)
         if self.settings.last_selected_company and self.settings.last_selected_company in selector_values:
             self.company_var.set(self.settings.last_selected_company)
@@ -1422,11 +1691,37 @@ class MainWindow(tk.Tk):
         self.overview_tree.heading("#0", text="Metric")
         self.overview_tree.heading("value", text="Latest Value")
         self.overview_tree.bind("<Configure>", self._center_overview_columns)
+        self.overview_tree.bind("<<TreeviewSelect>>", self._on_overview_row_selected)
         frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         self.after_idle(self._center_overview_columns)
 
+    def _on_overview_row_selected(self, event=None):
+        selection = self.overview_tree.selection()
+        if not selection:
+            return
+        row_text = str(
+            self.overview_tree.item(selection[0], "text")
+        ).strip().lower()
+        suffix = CLICK_FOR_MORE_INFO_SUFFIX.lower()
+        if row_text.endswith(suffix):
+            row_text = row_text[:-len(suffix)].rstrip()
+        if row_text == "health score (rank by income)":
+            rows = self._safe_read("Company_Rankings")
+            neighbors = rank_neighbors_from_sheet_rows(rows)
+            open_single_instance_popup(
+                self,
+                "health_score_neighbors",
+                lambda: HealthScoreNeighborsCard(self, neighbors),
+            )
+        elif row_text == "star 10 count":
+            summary = self._safe_read("Star_Income_Summary")
+            open_single_instance_popup(
+                self,
+                "star_income_summary",
+                lambda: StarIncomeSummaryCard(self, summary),
+            )
+
     def _center_overview_columns(self, event=None):
-        """Keep the Metric/Latest Value divider centered as the table sizes."""
         width = event.width if event is not None else self.overview_tree.winfo_width()
         if width <= 1:
             return
@@ -1435,6 +1730,141 @@ class MainWindow(tk.Tk):
         self.overview_tree.column("#0", width=metric_width, stretch=False)
         self.overview_tree.column("value", width=value_width, stretch=False)
 
+    def _build_company_rankings_tab(self):
+        top = ttk.Frame(self.company_rankings_tab)
+        top.pack(fill="x", padx=10, pady=10)
+        ttk.Button(top, text="Refresh", command=self.refresh_from_sheet).pack(side="left")
+        self._add_company_selector(top)
+        ttk.Label(
+            top,
+            text="Every same-type company ranked by weekly income, from your latest snapshot. "
+                 "\nYour own company is pinned above the list regardless of scroll position.",
+            foreground="#555555",
+            wraplength=460, justify="left",
+        ).pack(side="left", padx=10)
+
+        locked = ttk.LabelFrame(self.company_rankings_tab, text="Your Company")
+        locked.pack(fill="x", padx=10, pady=(0, 6))
+        self._company_rankings_locked_labels = {}
+        locked_columns = (
+            ("rank", "Rank"), ("daily_income", "Daily Income"),
+            ("weekly_income", "Weekly Income"),
+            ("next_star_gap", "Weekly Income Gap to Next Star"),
+            ("range_position", "Observed Range Position"),
+            ("previous_star_gap", "Weekly Income Gap to Previous Star"),
+            ("daily_change", "Change Since Yesterday"),
+        )
+        for index, (key, label) in enumerate(locked_columns):
+            col_index = index % 5
+            row_index = (index // 5) * 2
+            ttk.Label(locked, text=label, font=("TkDefaultFont", 9, "bold")).grid(
+                row=row_index, column=col_index, sticky="w", padx=10, pady=(6, 0)
+            )
+            value_label = ttk.Label(locked, text="-")
+            value_label.grid(
+                row=row_index + 1, column=col_index,
+                sticky="w", padx=10, pady=(0, 6),
+            )
+            self._company_rankings_locked_labels[key] = value_label
+
+        columns = ("rank", "name", "rating", "daily_income", "weekly_income")
+        self._company_rankings_rows = []
+        self._company_rankings_sort_column = "rank"
+        self._company_rankings_sort_reverse = False
+        self._company_rankings_heading_labels = {
+            column: pretty_label(column).title() for column in columns
+        }
+        tree_frame, self.company_rankings_tree = self._make_scrollable_tree(
+            self.company_rankings_tab, columns=columns, show="headings", height=18
+        )
+        for column in columns:
+            self.company_rankings_tree.heading(
+                column,
+                text=self._company_rankings_heading_labels[column],
+                command=lambda selected=column: self._sort_company_rankings(selected),
+            )
+            self.company_rankings_tree.column(column, width=130, anchor="center")
+        tree_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+    def _render_company_rankings(self, rows: list[dict]):
+        tree = self.company_rankings_tree
+        tree.delete(*tree.get_children())
+        active = self._company_rankings_sort_column
+        arrow = " ▼" if self._company_rankings_sort_reverse else " ▲"
+        for column in tree["columns"]:
+            label = self._company_rankings_heading_labels[column]
+            tree.heading(column, text=label + (arrow if column == active else ""))
+        for row in rows:
+            values = [
+                format_field(c, row.get(c, ""), "Company_Rankings")
+                for c in tree["columns"]
+            ]
+            tags = ("own_company",) if _is_own_company_row(row) else ()
+            tree.insert("", "end", values=values, tags=tags)
+        tree.tag_configure("own_company", font=("TkDefaultFont", 9, "bold"))
+
+    def _sort_company_rankings(self, column: str, toggle: bool = True):
+        if column not in self.company_rankings_tree["columns"]:
+            return
+        if toggle:
+            if column == self._company_rankings_sort_column:
+                self._company_rankings_sort_reverse = (
+                    not self._company_rankings_sort_reverse
+                )
+            else:
+                self._company_rankings_sort_column = column
+                self._company_rankings_sort_reverse = False
+        ordered = sort_company_ranking_rows(
+            self._company_rankings_rows,
+            self._company_rankings_sort_column,
+            self._company_rankings_sort_reverse,
+        )
+        self._render_company_rankings(ordered)
+
+    def _populate_company_rankings(self):
+        ranking_rows = self._safe_read("Company_Rankings")
+        self._company_rankings_rows = list(ranking_rows)
+        self._sort_company_rankings(
+            self._company_rankings_sort_column, toggle=False
+        )
+
+        history_rows = self._safe_read("Company_History")
+        latest = dict(
+            max(history_rows, key=lambda r: _safe_int_ts(r.get("timestamp")))
+        ) if history_rows else {}
+        fresh_progress = derive_star_progress(
+            ranking_rows, self._safe_read("Star_Income_Summary")
+        )
+        if fresh_progress:
+            latest.update(fresh_progress)
+        labels = self._company_rankings_locked_labels
+        labels["rank"]["text"] = latest.get("rank_by_income") or "-"
+        labels["daily_income"]["text"] = (
+            format_money(latest["daily_income"]) if latest.get("daily_income") not in (None, "") else "-"
+        )
+        labels["weekly_income"]["text"] = (
+            format_money(latest["weekly_income"]) if latest.get("weekly_income") not in (None, "") else "-"
+        )
+        def money_or_dash(*keys):
+            for key in keys:
+                value = latest.get(key)
+                if value not in (None, ""):
+                    return format_money(value)
+            return "-"
+
+        labels["next_star_gap"]["text"] = money_or_dash(
+            "income_to_reach_next_star", "income_to_reach_10_star"
+        )
+        position = latest.get("observed_range_position_percent")
+        try:
+            labels["range_position"]["text"] = f"{float(position):.0f}%"
+        except (TypeError, ValueError):
+            labels["range_position"]["text"] = "-"
+        labels["previous_star_gap"]["text"] = money_or_dash(
+            "income_to_drop_to_previous_star", "income_buffer_before_9_star"
+        )
+        labels["daily_change"]["text"] = money_or_dash("rolling_7day_change")
+
     def _populate_overview(self):
         self.overview_tree.delete(*self.overview_tree.get_children())
         records = self._safe_read("Company_History")
@@ -1442,19 +1872,61 @@ class MainWindow(tk.Tk):
             self.overview_tree.insert("", "end", text="No data yet", values=("Run a snapshot to populate this",))
             self._center_overview_columns()
             return
-        latest = max(records, key=lambda r: int(r.get("timestamp") or 0))
+        latest = dict(max(records, key=lambda r: _safe_int_ts(r.get("timestamp"))))
+        fresh_progress = derive_star_progress(
+            self._safe_read("Company_Rankings"),
+            self._safe_read("Star_Income_Summary"),
+        )
+        if fresh_progress:
+            latest.update(fresh_progress)
+
         capacity = latest.get("employees_capacity", "")
         rank_keys = {"rank_by_income", "rank_total_in_type", "rank_percentile", "rank_trend"}
+        legacy_star_keys = {
+            "income_to_reach_10_star", "income_buffer_before_9_star"
+        }
+        hidden_duplicate_star_keys = {
+            "observed_drop_buffer", "observed_next_star_gap"
+        }
+        try:
+            current_star = int(float(latest.get("rating")))
+        except (TypeError, ValueError):
+            current_star = None
+
         for key, value in latest.items():
-            if key == "employees_capacity" or key in rank_keys:
-                continue  # employees_capacity merges below; rank_* merges into one Health Score row
+            if (
+                key == "employees_capacity"
+                or key in rank_keys
+                or key in legacy_star_keys
+                or key in hidden_duplicate_star_keys
+            ):
+                continue
+            if key in {
+                "income_to_reach_next_star",
+                "required_weekly_income_to_star_up",
+            } and current_star == 10:
+                continue
+            if key == "income_to_drop_to_previous_star" and current_star == 1:
+                continue
             if key == "employees_hired":
                 self.overview_tree.insert(
                     "", "end", text="employees",
                     values=(f"{value}/{capacity}",),
                 )
                 continue
-            self.overview_tree.insert("", "end", text=pretty_label(key), values=(format_field(key, value, "Company_History"),))
+
+            label = pretty_label(key)
+            if current_star is not None:
+                if key == "income_to_reach_next_star":
+                    label = f"income to reach {current_star + 1} star"
+                elif key == "income_to_drop_to_previous_star":
+                    label = f"income to drop to {current_star - 1} star"
+            if key == "star_10_count":
+                label += CLICK_FOR_MORE_INFO_SUFFIX
+            self.overview_tree.insert(
+                "", "end", text=label,
+                values=(format_field(key, value, "Company_History"),),
+            )
 
         rank, total, percentile, trend = (
             latest.get("rank_by_income"), latest.get("rank_total_in_type"),
@@ -1464,12 +1936,12 @@ class MainWindow(tk.Tk):
             arrow = {"up": " \u25b2", "down": " \u25bc", "same": " \u2192"}.get(str(trend).strip().lower(), "")
             percentile_text = f", top {100 - float(percentile):.0f}%" if percentile not in (None, "") else ""
             self.overview_tree.insert(
-                "", "end", text="health score (rank by income)",
+                "", "end",
+                text="health score (rank by income)" + CLICK_FOR_MORE_INFO_SUFFIX,
                 values=(f"#{rank} of {total}{percentile_text}{arrow}",),
             )
         self._center_overview_columns()
 
-    # -------------------------------------------------------- employees --
     def _build_employees_tab(self):
         top = ttk.Frame(self.employee_overview_tab)
         top.pack(fill="x", padx=10, pady=10)
@@ -1510,11 +1982,8 @@ class MainWindow(tk.Tk):
         ]
 
         if saved_columns:
-            # Preserve the exact saved left-to-right order.
             self.employee_visible_columns = saved_columns
         else:
-            # On first use, follow EMPLOYEE_TABLE_COLUMNS order while selecting
-            # only the default visible columns.
             self.employee_visible_columns = [
                 key
                 for _, key in EMPLOYEE_TABLE_COLUMNS
@@ -1545,9 +2014,6 @@ class MainWindow(tk.Tk):
     def _populate_employees(self):
         records = self._safe_read("Employee_Effectiveness")
         if not records:
-            # Fall back to the plain Employees tab (always written by
-            # run_snapshot()) so there's still something to look at for a
-            # company that hasn't had an Employee Efficiency run yet.
             records = self._safe_read("Employees")
         self._employee_records_cache = records
         self._apply_employee_filter()
@@ -1593,19 +2059,39 @@ class MainWindow(tk.Tk):
             arrow = ""
             if column == self._employee_sort_column:
                 arrow = " ▼" if self._employee_sort_reverse else " ▲"
-            tk.Button(
-                self.employees_grid,
-                text=self._employee_labels[column] + arrow,
-                command=lambda col=column: self._sort_employees(col, False),
-                font=("TkDefaultFont", 9, "bold"),
-                background="#d9d9d9",
-                activebackground="#c9c9c9",
-                relief="ridge",
-                borderwidth=1,
-                width=widths[column],
-                padx=4,
-                pady=3,
-            ).grid(row=0, column=column_index, sticky="nsew")
+            header_text = self._employee_labels[column] + arrow
+            if column in EMPLOYEE_EFFECTIVENESS_EXPLAINED_COLUMNS:
+                header_cell = tk.Frame(self.employees_grid, background="#d9d9d9")
+                tk.Button(
+                    header_cell,
+                    text=header_text,
+                    command=lambda col=column: self._sort_employees(col, False),
+                    font=("TkDefaultFont", 9, "bold"),
+                    background="#d9d9d9",
+                    activebackground="#c9c9c9",
+                    relief="ridge",
+                    borderwidth=1,
+                    padx=4,
+                    pady=3,
+                ).pack(side="left", fill="both", expand=True)
+                make_info_glyph(
+                    header_cell, column, title=self._employee_labels[column].replace("\n", " ")
+                ).pack(side="right", fill="y")
+                header_cell.grid(row=0, column=column_index, sticky="nsew")
+            else:
+                tk.Button(
+                    self.employees_grid,
+                    text=header_text,
+                    command=lambda col=column: self._sort_employees(col, False),
+                    font=("TkDefaultFont", 9, "bold"),
+                    background="#d9d9d9",
+                    activebackground="#c9c9c9",
+                    relief="ridge",
+                    borderwidth=1,
+                    width=widths[column],
+                    padx=4,
+                    pady=3,
+                ).grid(row=0, column=column_index, sticky="nsew")
 
         for row_index, (row, values) in enumerate(zip(records, formatted_rows), start=1):
             tags = self._employee_row_tags(row)
@@ -1753,9 +2239,6 @@ class MainWindow(tk.Tk):
             return
         positions = company.get("last_known_positions") or []
         if not positions:
-            # Fall back to whatever positions are visible in the currently
-            # loaded roster, in case a Snapshot has run but Employee
-            # Efficiency hasn't (which is what populates last_known_positions).
             positions = sorted({r.get("current_position") or r.get("position") for r in self._employee_records_cache} - {None, ""})
         if not positions:
             messagebox.showinfo(
@@ -1780,13 +2263,13 @@ class MainWindow(tk.Tk):
             except Exception:
                 messagebox.showerror("Save failed", "Could not save companies to companies.json")
 
-    # ------------------------------------------ base effectiveness projections --
     def _build_base_effectiveness_tab(self):
         top = ttk.Frame(self.base_effectiveness_tab)
         top.pack(fill="x", padx=10, pady=10)
         ttk.Button(top, text="Update Employee Efficiency", command=self.run_employee_efficiency).pack(side="left")
         ttk.Button(top, text="Refresh from Sheet", command=self.refresh_from_sheet).pack(side="left", padx=(6, 0))
         ttk.Button(top, text="Configure Positions", command=self._configure_position_efficiency_positions).pack(side="left", padx=(6, 0))
+        make_info_glyph(top, "base_effectiveness_projections", title="Base Effectiveness Projections").pack(side="left", padx=(6, 0))
         self._add_company_selector(top)
         ttk.Label(
             top,
@@ -1801,22 +2284,32 @@ class MainWindow(tk.Tk):
             self.base_effectiveness_tab
         )
         frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-        self._position_efficiency_records_cache = []
         self._employee_info_lookup = {}
-        self._position_efficiency_columns = ()
-        self._position_efficiency_labels = {}
-        self._position_efficiency_sort_column = None
-        self._position_efficiency_sort_reverse = False
+        self._position_efficiency_states = {}
 
-    # ----------------------------------------- total effectiveness projections --
-    def _build_total_effectiveness_placeholder(self):
-        """Empty placeholder for the Total Effectiveness Projections sub-tab.
-        Wired with real data in Phase 2."""
+    def _build_total_effectiveness_tab(self):
+        top = ttk.Frame(self.total_effectiveness_tab)
+        top.pack(fill="x", padx=10, pady=10)
+        ttk.Button(top, text="Update Employee Efficiency", command=self.run_employee_efficiency).pack(side="left")
+        ttk.Button(top, text="Refresh from Sheet", command=self.refresh_from_sheet).pack(side="left", padx=(6, 0))
+        ttk.Button(top, text="Configure Positions", command=self._configure_position_efficiency_positions).pack(side="left", padx=(6, 0))
+        make_info_glyph(top, "total_effectiveness_projections", title="Total Effectiveness Projections").pack(side="left", padx=(6, 0))
+        self._add_company_selector(top)
         ttk.Label(
-            self.total_effectiveness_tab,
-            text="Total Effectiveness Projections — coming in Phase 2.",
-            foreground="#888888",
-        ).pack(padx=20, pady=20, anchor="nw")
+            top,
+            text="Base projection plus each employee's non-work-stats effectiveness "
+                 "(settled in, education, addiction, inactivity, management, book, merits) "
+                 "applied to every position. "
+                 "\nClick a column heading to sort. \nRead straight from "
+                 "Total_Effectiveness_Projections (Update Employee Efficiency to update from Spreadsheet).",
+            foreground="#555555",
+            wraplength=460, justify="left",
+        ).pack(side="left", padx=10)
+
+        frame, self.total_effectiveness_canvas = self._make_scrollable_canvas(
+            self.total_effectiveness_tab
+        )
+        frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
     def _configure_position_efficiency_positions(self):
         company = self._active_company()
@@ -1843,24 +2336,27 @@ class MainWindow(tk.Tk):
                 messagebox.showerror("Save failed", "Could not save companies to companies.json")
                 return
             self._populate_position_efficiency()
+            self._populate_position_efficiency(
+                sheet_name="Total_Effectiveness_Projections",
+                canvas=self.total_effectiveness_canvas,
+                key="total",
+            )
 
-    def _populate_position_efficiency(self, sheet_name="Position_Efficiency", canvas=None):
-        """Populate the position efficiency grid from *sheet_name*.
+    def _pe_state(self, key):
+        return self._position_efficiency_states.setdefault(key, {
+            "records": [],
+            "columns": (),
+            "labels": {},
+            "sort_column": None,
+            "sort_reverse": False,
+        })
 
-        *canvas* selects which scrollable canvas to render into; defaults to
-        self.base_effectiveness_canvas. Phase 2 will pass
-        self.total_effectiveness_canvas when populating the second sub-tab."""
+    def _populate_position_efficiency(self, sheet_name="Position_Efficiency", canvas=None, key="base"):
         canvas = canvas if canvas is not None else self.base_effectiveness_canvas
+        state = self._pe_state(key)
         records = self._safe_read(sheet_name)
-        self._position_efficiency_records_cache = records
+        state["records"] = records
 
-        # Independent lookup for the employee info card popup - read fresh
-        # from Employee_Effectiveness (not the Employees tab's cache/fallback,
-        # which uses a different position-key name and lacks work stats).
-        # Position_Efficiency and Employee_Effectiveness are always written
-        # together by the same run_employee_efficiency() call, so if a
-        # Position_Efficiency row exists here, its matching
-        # Employee_Effectiveness row is guaranteed to exist too.
         info_records = self._safe_read("Employee_Effectiveness")
         self._employee_info_lookup = {
             str(record.get("tId")): record
@@ -1882,35 +2378,33 @@ class MainWindow(tk.Tk):
             return
 
         meta_cols = {"tId", "name", "current_position"}
-        detected_positions = [key for key in records[0] if key not in meta_cols]
+        detected_positions = [key_ for key_ in records[0] if key_ not in meta_cols]
         company = self._active_company() or {}
         known_positions = sorted(set(detected_positions) | set(company.get("last_known_positions") or []))
         self._position_efficiency_all_positions = known_positions
         hidden = set(company.get("position_efficiency_hidden_positions") or [])
         position_names = [position for position in known_positions if position not in hidden]
 
-        self._position_efficiency_columns = (
-            "name", "current_position", "current_efficiency", *position_names
-        )
-        self._position_efficiency_labels = {
-            "name": "Name",
+        state["columns"] = ("name", "current_position", "current_efficiency", *position_names)
+        state["labels"] = {
+            "name": "Name" + CLICK_FOR_MORE_INFO_SUFFIX,
             "current_position": "Current Position",
             "current_efficiency": "Current Eff.",
         }
         self._sort_position_efficiency(
-            self._position_efficiency_sort_column or "name",
-            self._position_efficiency_sort_reverse,
+            state["sort_column"] or "name",
+            state["sort_reverse"],
             toggle=False,
             canvas=canvas,
+            key=key,
         )
 
-    def _render_position_efficiency_rows(self, records, canvas=None):
-        """Render *records* into *canvas* (defaults to self.base_effectiveness_canvas).
-        Phase 2 passes self.total_effectiveness_canvas for the second sub-tab."""
+    def _render_position_efficiency_rows(self, records, canvas=None, key="base"):
         canvas = canvas if canvas is not None else self.base_effectiveness_canvas
+        state = self._pe_state(key)
         canvas.delete("all")
-        columns = self._position_efficiency_columns
-        labels = self._position_efficiency_labels
+        columns = state["columns"]
+        labels = state["labels"]
         body_font = tkfont.nametofont("TkDefaultFont")
         header_font = tkfont.Font(
             root=self,
@@ -1939,10 +2433,10 @@ class MainWindow(tk.Tk):
         x = 0
         for column_index, column in enumerate(columns):
             arrow = ""
-            if column == self._position_efficiency_sort_column:
-                arrow = " ▼" if self._position_efficiency_sort_reverse else " ▲"
+            if column == state["sort_column"]:
+                arrow = " ▼" if state["sort_reverse"] else " ▲"
             width = widths[column]
-            tag = f"position_efficiency_header_{column_index}"
+            tag = f"position_efficiency_header_{key}_{column_index}"
             canvas.create_rectangle(
                 x, 0, x + width, header_height,
                 fill="#d9d9d9", outline="#a0a0a0", width=1, tags=(tag,),
@@ -1958,7 +2452,7 @@ class MainWindow(tk.Tk):
             canvas.tag_bind(
                 tag,
                 "<Button-1>",
-                lambda event, col=column, cv=canvas: self._sort_position_efficiency(col, False, canvas=cv),
+                lambda event, col=column, cv=canvas, current_key=key: self._sort_position_efficiency(col, False, canvas=cv, key=current_key),
             )
             x += width
 
@@ -1984,7 +2478,6 @@ class MainWindow(tk.Tk):
                 border_width = 3 if is_current_position else 1
                 cell_tags = ()
                 if column == "name":
-                    # Clickable - opens the employee info card popup.
                     cell_tags = (f"pe_name_cell_{row_index}",)
                 canvas.create_rectangle(
                     x,
@@ -2021,29 +2514,30 @@ class MainWindow(tk.Tk):
         canvas.configure(scrollregion=(0, 0, total_width, total_height))
 
     def _show_employee_info_card(self, tid):
-        record = self._employee_info_lookup.get(str(tid)) if tid not in (None, "") else None
-        EmployeeInfoCard(self, record)
+        tid_key = str(tid) if tid not in (None, "") else "missing"
+        record = self._employee_info_lookup.get(tid_key) if tid_key != "missing" else None
+        open_single_instance_popup(
+            self,
+            f"employee_info:{tid_key}",
+            lambda: EmployeeInfoCard(self, record),
+        )
 
-    def _sort_position_efficiency(self, column, reverse, toggle=True, canvas=None):
-        """Sort and re-render the position efficiency grid.
-
-        *canvas* is forwarded to _render_position_efficiency_rows; defaults to
-        self.base_effectiveness_canvas. Phase 2 passes the total tab's canvas."""
-        if toggle and column == self._position_efficiency_sort_column:
-            reverse = not self._position_efficiency_sort_reverse
+    def _sort_position_efficiency(self, column, reverse, toggle=True, canvas=None, key="base"):
+        state = self._pe_state(key)
+        if toggle and column == state["sort_column"]:
+            reverse = not state["sort_reverse"]
         elif toggle and column in {"name", "current_position"}:
             reverse = False
 
         records = sorted(
-            self._position_efficiency_records_cache,
+            state["records"],
             key=lambda record: position_efficiency_sort_value(record, column),
             reverse=reverse,
         )
-        self._position_efficiency_sort_column = column
-        self._position_efficiency_sort_reverse = reverse
-        self._render_position_efficiency_rows(records, canvas=canvas)
+        state["sort_column"] = column
+        state["sort_reverse"] = reverse
+        self._render_position_efficiency_rows(records, canvas=canvas, key=key)
 
-    # ------------------------------------------------------------ stock --
     def _build_stock_tab(self):
         top = ttk.Frame(self.stock_sub_tab)
         top.pack(fill="x", padx=10, pady=10)
@@ -2051,7 +2545,8 @@ class MainWindow(tk.Tk):
         self._add_company_selector(top)
         ttk.Label(
             top,
-            text="Shows stock information (in-stock, sold, cost, price, created) \nand a chart of total sold worth over time. ",
+            text="Shows each stock item's last 7 snapshots (in-stock, sold, cost, price, created) "
+                 "\nso you can compare against the last week, plus a chart of total sold worth over time. ",
             foreground="#555555",
             wraplength=460, justify="left",
         ).pack(side="left", padx=10)
@@ -2059,9 +2554,9 @@ class MainWindow(tk.Tk):
         paned = ttk.PanedWindow(self.stock_sub_tab, orient="vertical")
         paned.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
-        columns = ["name", "in_stock", "delta_in_stock", "cost", "price", "sold_amount", "sold_worth", "created"]
+        columns = ["name", "date", "in_stock", "delta_in_stock", "cost", "price", "sold_amount", "sold_worth", "created"]
         column_labels = {"delta_in_stock": "in_stock_difference"}
-        tree_frame, self.stock_tree = self._make_scrollable_tree(paned, columns=columns, show="headings", height=10)
+        tree_frame, self.stock_tree = self._make_scrollable_tree(paned, columns=columns, show="headings", height=18)
         for col in columns:
             self.stock_tree.heading(col, text=pretty_label(column_labels.get(col, col)))
             self.stock_tree.column(col, width=130, anchor="center")
@@ -2080,27 +2575,20 @@ class MainWindow(tk.Tk):
         if not records:
             return
 
-        # latest row per stock name
-        latest_by_name = {}
-        for row in records:
-            name = row.get("name")
-            ts = int(row.get("timestamp") or 0)
-            if name not in latest_by_name or ts > int(latest_by_name[name].get("timestamp", 0)):
-                latest_by_name[name] = row
+        recent_rows = select_recent_stock_history_rows(records)
 
         columns = self.stock_tree["columns"]
-        for row in latest_by_name.values():
+        for row in recent_rows:
             self.stock_tree.insert(
                 "", "end",
                 values=[format_field(c, row.get(c, ""), "Stock_History") for c in columns],
             )
         self._autosize_columns(self.stock_tree)
 
-        # chart: total sold_worth over time across all stocks
         totals_by_ts = {}
         label_by_ts = {}
         for row in records:
-            ts = int(row.get("timestamp") or 0)
+            ts = _safe_int_ts(row.get("timestamp"))
             worth = float(row.get("sold_worth") or 0)
             totals_by_ts[ts] = totals_by_ts.get(ts, 0) + worth
             label_by_ts[ts] = row.get("date") or str(ts)
@@ -2117,7 +2605,6 @@ class MainWindow(tk.Tk):
         self.stock_fig.tight_layout()
         self.stock_canvas.draw()
 
-    # ----------------------------------------------------------- trends --
     def _build_trends_tab(self):
         top = ttk.Frame(self.company_trends_tab)
         top.pack(fill="x", padx=10, pady=10)
@@ -2144,9 +2631,8 @@ class MainWindow(tk.Tk):
             "company_funds", "popularity", "efficiency", "environment", "total_wage",
             "avg_employee_effectiveness", "daily_stockcost",
             "avg_daily_profit_7day", "avg_daily_income_7day",
+            "monthly_income", "monthly_profit",
         ]
-        # Dropdown shows space-separated labels; keep a label->raw-field-name
-        # mapping so chart data lookups still use the real column name.
         self._trend_metric_label_to_key = {pretty_label(c): c for c in numeric_cols}
         labels = list(self._trend_metric_label_to_key.keys())
         self.trend_metric_combo["values"] = labels
@@ -2156,7 +2642,7 @@ class MainWindow(tk.Tk):
 
     def _draw_trend(self):
         records = getattr(self, "_company_history_cache", [])
-        records = sorted(records, key=lambda r: int(r.get("timestamp") or 0))
+        records = sorted(records, key=lambda r: _safe_int_ts(r.get("timestamp")))
         label = self.trend_metric_var.get()
         metric = getattr(self, "_trend_metric_label_to_key", {}).get(label, label)
         self.trend_ax.clear()
@@ -2175,16 +2661,10 @@ class MainWindow(tk.Tk):
         self.trend_fig.tight_layout()
         self.trend_canvas.draw()
 
-    # --------------------------------------------------------- settings --
     def _build_settings_tab(self):
         frame = ttk.Frame(self.settings_tab)
         frame.pack(fill="both", expand=True, padx=20, pady=20)
 
-        # Account-level settings only. Torn API keys and Sheet IDs live
-        # exclusively in the Companies list below - there is no separate
-        # "primary company" typed in here anymore, so there's no way to
-        # accidentally overwrite one company's key while trying to add
-        # another one.
         self._settings_vars = {
             "snapshot_interval_minutes": tk.StringVar(value=str(self.settings.snapshot_interval_minutes)),
         }
@@ -2205,7 +2685,6 @@ class MainWindow(tk.Tk):
         ttk.Button(frame, text="Save Securely", command=self._save_settings).grid(row=row, column=0, pady=16, sticky="w")
         ttk.Button(frame, text="Sign in with Google", command=self._sign_in_google).grid(row=row, column=1, pady=16, sticky="w")
 
-        # -- Companies management area --
         row += 1
         legacy_btn_row = ttk.Frame(frame)
         legacy_btn_row.grid(row=row, column=0, columnspan=2, pady=(0, 8), sticky="w")
@@ -2235,6 +2714,74 @@ class MainWindow(tk.Tk):
         frame.columnconfigure(1, weight=1)
         self._refresh_companies_list()
 
+        row += 1
+        scheduled = ttk.LabelFrame(frame, text="Scheduled Daily Collection", padding=10)
+        scheduled.grid(
+            row=row, column=0, columnspan=3, sticky="ew", pady=(16, 0)
+        )
+        self._scheduled_enabled_var = tk.BooleanVar(
+            value=self.settings.scheduled_collection_enabled
+        )
+        self._scheduled_wake_var = tk.BooleanVar(
+            value=self.settings.scheduled_wake_computer
+        )
+        ttk.Checkbutton(
+            scheduled,
+            text="Enable Windows background collection",
+            variable=self._scheduled_enabled_var,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(
+            scheduled,
+            text="Wake the computer when possible",
+            variable=self._scheduled_wake_var,
+        ).grid(row=0, column=1, sticky="w", padx=(16, 0))
+        ttk.Label(
+            scheduled,
+            text=(
+                "Runs hourly as the current Windows user, but collects only once "
+                "per 18:10 UTC reporting period. Select no companies to include all."
+            ),
+            wraplength=720,
+            justify="left",
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 4))
+
+        self._scheduled_companies_listbox = tk.Listbox(
+            scheduled, height=4, selectmode="multiple", exportselection=False
+        )
+        self._scheduled_companies_listbox.grid(
+            row=2, column=0, columnspan=2, sticky="ew", pady=4
+        )
+        selected_names = set(self.settings.scheduled_company_names)
+        for index, company in enumerate(self.companies):
+            name = str(company.get("name") or "Unnamed")
+            self._scheduled_companies_listbox.insert("end", name)
+            if name in selected_names:
+                self._scheduled_companies_listbox.selection_set(index)
+
+        buttons = ttk.Frame(scheduled)
+        buttons.grid(row=2, column=2, sticky="n", padx=(8, 0))
+        ttk.Button(
+            buttons, text="Apply Schedule", command=self._apply_scheduled_task
+        ).pack(fill="x")
+        ttk.Button(
+            buttons, text="Run Test Now", command=self._run_scheduled_test
+        ).pack(fill="x", pady=4)
+        ttk.Button(
+            buttons, text="Repair Task", command=self._repair_scheduled_task
+        ).pack(fill="x")
+        ttk.Button(
+            buttons, text="Refresh Status", command=self._refresh_scheduled_status
+        ).pack(fill="x", pady=(4, 0))
+
+        self._scheduled_status_var = tk.StringVar(
+            value=self.settings.scheduled_last_result or "Status not checked."
+        )
+        ttk.Label(
+            scheduled, textvariable=self._scheduled_status_var, wraplength=720,
+            justify="left",
+        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        scheduled.columnconfigure(1, weight=1)
+
     def _save_settings(self):
         s = self.settings
         try:
@@ -2244,6 +2791,103 @@ class MainWindow(tk.Tk):
         s.save()
         self.set_status("Settings saved securely for this Windows user.")
         messagebox.showinfo("Saved", "Settings were encrypted for this Windows user.")
+
+    def _scheduled_selected_names(self) -> list[str]:
+        box = self._scheduled_companies_listbox
+        return [str(box.get(index)) for index in box.curselection()]
+
+    def _apply_scheduled_task(self):
+        self.settings.scheduled_collection_enabled = bool(
+            self._scheduled_enabled_var.get()
+        )
+        self.settings.scheduled_wake_computer = bool(
+            self._scheduled_wake_var.get()
+        )
+        self.settings.scheduled_company_names = self._scheduled_selected_names()
+        try:
+            if self.settings.scheduled_collection_enabled:
+                install_task(
+                    wake_computer=self.settings.scheduled_wake_computer
+                )
+            else:
+                remove_task()
+            self.settings.save()
+            self._refresh_scheduled_status()
+            self.set_status("Scheduled collection settings updated.")
+        except Exception as exc:
+            self._scheduled_status_var.set(f"Schedule update failed: {exc}")
+            messagebox.showerror("Scheduled Collection", str(exc))
+
+    def _refresh_scheduled_status(self):
+        try:
+            status = task_status()
+            if not status.get("installed"):
+                text = "Windows task is not installed."
+            else:
+                text = (
+                    f"Status: {status.get('status') or 'Installed'} | "
+                    f"Next: {status.get('next_run') or 'Unknown'} | "
+                    f"Last: {status.get('last_run') or 'Never'} | "
+                    f"Result: {status.get('last_result') or 'Unknown'}"
+                )
+            if self.settings.scheduled_last_result:
+                text += f" | App: {self.settings.scheduled_last_result}"
+            self._scheduled_status_var.set(text)
+        except Exception as exc:
+            self._scheduled_status_var.set(f"Could not read task status: {exc}")
+
+    def _repair_scheduled_task(self):
+        try:
+            self.settings.scheduled_collection_enabled = True
+            self._scheduled_enabled_var.set(True)
+            self.settings.scheduled_wake_computer = bool(
+                self._scheduled_wake_var.get()
+            )
+            self.settings.scheduled_company_names = self._scheduled_selected_names()
+            repair_task(wake_computer=self.settings.scheduled_wake_computer)
+            self.settings.save()
+            self._refresh_scheduled_status()
+        except Exception as exc:
+            messagebox.showerror("Scheduled Collection", str(exc))
+
+    def _run_scheduled_test(self):
+        if not self.companies:
+            messagebox.showwarning(
+                "Scheduled Collection", "Add at least one company first."
+            )
+            return
+        self.settings.scheduled_company_names = self._scheduled_selected_names()
+        self.settings.scheduled_wake_computer = bool(self._scheduled_wake_var.get())
+        self._scheduled_status_var.set("Running scheduled collection test...")
+
+        def worker():
+            return run_scheduled_collection(
+                self.companies, self.settings, force=True, persist=True
+            )
+
+        def done(result):
+            exit_code, _rows = result
+            self._scheduled_status_var.set(self.settings.scheduled_last_result)
+            if exit_code:
+                messagebox.showerror(
+                    "Scheduled Collection", self.settings.scheduled_last_result
+                )
+            else:
+                self._refresh_all(silent=True)
+
+        def run():
+            try:
+                result = worker()
+                self.after(0, lambda: done(result))
+            except Exception as exc:
+                self.after(
+                    0,
+                    lambda err=str(exc): self._scheduled_status_var.set(
+                        f"Test failed: {err}"
+                    ),
+                )
+
+        threading.Thread(target=run, daemon=True).start()
 
     def _sign_in_google(self):
         self._save_settings()
@@ -2316,8 +2960,6 @@ class MainWindow(tk.Tk):
             messagebox.showerror("Connection failed", str(e))
 
     def _on_companies_listbox_select(self):
-        """Selecting a company in the Settings list also drives the Overview
-        selector, so 'Test Connection' always tests whatever's highlighted."""
         sel = self._companies_listbox.curselection()
         if not sel or sel[0] >= len(self.companies):
             return
@@ -2327,7 +2969,6 @@ class MainWindow(tk.Tk):
         self.settings.save()
 
     def _on_company_selected(self):
-        """Called when company selection changes. Persist it and refresh."""
         sel = self.company_var.get()
         if sel == "(No companies configured)":
             sel = ""
@@ -2335,12 +2976,10 @@ class MainWindow(tk.Tk):
         self.settings.save()
         self.refresh_from_sheet()
 
-    # ------------------------------------------------------------ actions --
     def set_status(self, text: str):
         self.status_var.set(text)
 
     def run_snapshot(self):
-        """Run a snapshot for every company configured in Settings > Companies."""
         if not self.companies:
             messagebox.showinfo(
                 "No companies configured",
@@ -2351,34 +2990,32 @@ class MainWindow(tk.Tk):
         self.set_status("Running snapshot...")
 
         def worker():
-            from app.collector import run_company_snapshots, persist_companies
-            results = run_company_snapshots(self.companies, base_settings=self.settings)
-            # self.companies always comes from companies_mod.load_companies()
-            # at startup (or the one-time legacy migration, which already
-            # saves itself), so it's always safe to persist here - any
-            # auto-created Sheet ID or updated Health Score rank needs to be
-            # written back now, or it's silently lost (worse: a blank Sheet
-            # ID would auto-create a brand-new Sheet again on every run).
             try:
-                persist_companies(self.companies)
-            except Exception:
-                pass  # non-fatal - snapshot results still get shown either way
+                from app.collector import run_company_snapshots, persist_companies
+                results = run_company_snapshots(self.companies, base_settings=self.settings)
+                try:
+                    persist_companies(self.companies)
+                except Exception:
+                    pass
 
-            def finish():
-                messages = []
-                for name, res in results:
-                    if res.ok:
-                        messages.append(f"{name}: OK ({res.employee_count} employees, {res.stock_count} stock)")
-                    else:
-                        messages.append(f"{name}: FAIL - {res.message}")
-                self._on_snapshot_done(results[0][1] if results else None)
-                messagebox.showinfo("Snapshot Results", "\n".join(messages))
-            self.after(0, finish)
+                def finish():
+                    messages = []
+                    for name, res in results:
+                        if res.ok:
+                            messages.append(f"{name}: OK ({res.employee_count} employees, {res.stock_count} stock)")
+                        else:
+                            messages.append(f"{name}: FAIL - {res.message}")
+                    self._on_snapshot_done(results[0][1] if results else None)
+                    messagebox.showinfo("Snapshot Results", "\n".join(messages))
+                self.after(0, finish)
+            except Exception as exc:
+                err_msg = str(exc)
+                self.after(0, lambda: self.set_status(f"Snapshot failed: {err_msg}"))
+                self.after(0, lambda: messagebox.showerror("Snapshot Error", f"Snapshot failed:\n{err_msg}"))
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_snapshot_done(self, result):
-        # result may be None when multiple results were shown directly
         if not result:
             self.set_status("Snapshot(s) complete.")
             self.refresh_from_sheet()
@@ -2394,10 +3031,6 @@ class MainWindow(tk.Tk):
             messagebox.showerror("Snapshot failed", result.message)
 
     def run_employee_efficiency(self):
-        """Run an Employee Efficiency pass for every company configured in
-        Settings > Companies. Needs each company to have both a Torn API
-        key and a Tornstats API key - companies missing the latter report
-        back a failure message rather than being silently skipped."""
         if not self.companies:
             messagebox.showinfo(
                 "No companies configured",
@@ -2408,33 +3041,36 @@ class MainWindow(tk.Tk):
         self.set_status("Running employee efficiency...")
 
         def worker():
-            from app.collector import run_employee_efficiency_for_companies, persist_companies
-            results = run_employee_efficiency_for_companies(self.companies, base_settings=self.settings)
             try:
-                persist_companies(self.companies)
-            except Exception:
-                pass
+                from app.collector import run_employee_efficiency_for_companies, persist_companies
+                results = run_employee_efficiency_for_companies(self.companies, base_settings=self.settings)
+                try:
+                    persist_companies(self.companies)
+                except Exception:
+                    pass
 
-            def finish():
-                messages = []
-                for name, res in results:
-                    if res.ok:
-                        line = f"{name}: OK ({res.employee_count} employees, {res.misplaced_count} misplaced)"
-                        if getattr(res, "verification_note", ""):
-                            line += f"\n    \u26a0 {res.verification_note}"
-                        messages.append(line)
-                    else:
-                        messages.append(f"{name}: FAIL - {res.message}")
-                self.set_status("Employee efficiency update complete.")
-                self.refresh_from_sheet()
-                messagebox.showinfo("Employee Efficiency Results", "\n".join(messages))
-            self.after(0, finish)
+                def finish():
+                    messages = []
+                    for name, res in results:
+                        if res.ok:
+                            line = f"{name}: OK ({res.employee_count} employees, {res.misplaced_count} misplaced)"
+                            if getattr(res, "verification_note", ""):
+                                line += f"\n    \u26a0 {res.verification_note}"
+                            messages.append(line)
+                        else:
+                            messages.append(f"{name}: FAIL - {res.message}")
+                    self.set_status("Employee efficiency update complete.")
+                    self.refresh_from_sheet()
+                    messagebox.showinfo("Employee Efficiency Results", "\n".join(messages))
+                self.after(0, finish)
+            except Exception as exc:
+                err_msg = str(exc)
+                self.after(0, lambda: self.set_status(f"Employee efficiency failed: {err_msg}"))
+                self.after(0, lambda: messagebox.showerror("Employee Efficiency Error", f"Employee efficiency failed:\n{err_msg}"))
 
         threading.Thread(target=worker, daemon=True).start()
 
     def run_everything(self):
-        """Run both a Snapshot and an Employee Efficiency pass for every
-        configured company, in one click."""
         if not self.companies:
             messagebox.showinfo(
                 "No companies configured",
@@ -2445,33 +3081,38 @@ class MainWindow(tk.Tk):
         self.set_status("Running snapshot + employee efficiency...")
 
         def worker():
-            from app.collector import run_everything_for_companies, persist_companies
-            results = run_everything_for_companies(self.companies, base_settings=self.settings)
             try:
-                persist_companies(self.companies)
-            except Exception:
-                pass
+                from app.collector import run_everything_for_companies, persist_companies
+                results = run_everything_for_companies(self.companies, base_settings=self.settings)
+                try:
+                    persist_companies(self.companies)
+                except Exception:
+                    pass
 
-            def finish():
-                messages = []
-                for name, res in results:
-                    if res.ok:
-                        s, e = res.snapshot, res.employee_efficiency
-                        parts = [f"Snapshot OK ({s.employee_count} employees, {s.stock_count} stock)" if s.ok else f"Snapshot FAIL - {s.message}"]
-                        if e.ok:
-                            eff_part = f"Efficiency OK ({e.misplaced_count} misplaced)"
-                            if getattr(e, "verification_note", ""):
-                                eff_part += f" [\u26a0 {e.verification_note}]"
-                            parts.append(eff_part)
+                def finish():
+                    messages = []
+                    for name, res in results:
+                        if res.ok:
+                            s, e = res.snapshot, res.employee_efficiency
+                            parts = [f"Snapshot OK ({s.employee_count} employees, {s.stock_count} stock)" if s.ok else f"Snapshot FAIL - {s.message}"]
+                            if e.ok:
+                                eff_part = f"Efficiency OK ({e.misplaced_count} misplaced)"
+                                if getattr(e, "verification_note", ""):
+                                    eff_part += f" [\u26a0 {e.verification_note}]"
+                                parts.append(eff_part)
+                            else:
+                                parts.append(f"Efficiency FAIL - {e.message}")
+                            messages.append(f"{name}: " + "; ".join(parts))
                         else:
-                            parts.append(f"Efficiency FAIL - {e.message}")
-                        messages.append(f"{name}: " + "; ".join(parts))
-                    else:
-                        messages.append(f"{name}: {res.message}")
-                self.set_status("Run Everything complete.")
-                self.refresh_from_sheet()
-                messagebox.showinfo("Run Everything Results", "\n".join(messages))
-            self.after(0, finish)
+                            messages.append(f"{name}: {res.message}")
+                    self.set_status("Run Everything complete.")
+                    self.refresh_from_sheet()
+                    messagebox.showinfo("Run Everything Results", "\n".join(messages))
+                self.after(0, finish)
+            except Exception as exc:
+                err_msg = str(exc)
+                self.after(0, lambda: self.set_status(f"Run Everything failed: {err_msg}"))
+                self.after(0, lambda: messagebox.showerror("Run Everything Error", f"Run Everything failed:\n{err_msg}"))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -2486,13 +3127,18 @@ class MainWindow(tk.Tk):
     def _refresh_all(self, silent: bool):
         try:
             self._populate_overview()
+            self._populate_company_rankings()
             self._populate_employees()
             self._populate_position_efficiency()
+            self._populate_position_efficiency(
+                sheet_name="Total_Effectiveness_Projections",
+                canvas=self.total_effectiveness_canvas,
+                key="total",
+            )
             self._populate_stock()
             self._populate_trends()
             if not silent:
                 self.set_status("Refreshed.")
-            # refresh company selector values in case companies.json changed externally
             try:
                 self._update_company_selectors()
             except Exception:
@@ -2500,11 +3146,7 @@ class MainWindow(tk.Tk):
         except Exception as e:
             self.set_status(f"Refresh failed: {e}")
 
-    # ---------------------------------------------------------------- io --
     def _active_company(self) -> dict | None:
-        """Return the actual company dict (same object as in self.companies,
-        so mutating it and calling companies_mod.save_companies(self.companies)
-        persists it) for the currently selected company, or None."""
         sel = (self.company_var.get() or "").strip()
         for c in self.companies:
             if c.get("name") == sel:
@@ -2512,12 +3154,10 @@ class MainWindow(tk.Tk):
         return self.companies[0] if self.companies else None
 
     def _active_company_sheet_override(self) -> tuple:
-        """Return (sheet_id, sheet_name) for the currently selected company (or empty strings)."""
         sel = (self.company_var.get() or "").strip()
         for c in self.companies:
             if c.get("name") == sel:
                 return c.get("google_sheet_id", ""), c.get("google_sheet_name", "")
-        # Nothing selected yet - fall back to the first configured company, if any.
         if self.companies:
             c = self.companies[0]
             return c.get("google_sheet_id", ""), c.get("google_sheet_name", "")
@@ -2536,7 +3176,6 @@ class MainWindow(tk.Tk):
         except Exception:
             return []
 
-    # ------------------------- companies UI helpers -------------------------
     def _refresh_companies_list(self):
         try:
             self._companies_listbox.delete(0, tk.END)
@@ -2544,7 +3183,15 @@ class MainWindow(tk.Tk):
             return
         for c in self.companies:
             self._companies_listbox.insert(tk.END, c.get("name", "Unnamed"))
-        # update selector values as well
+        scheduled_box = getattr(self, "_scheduled_companies_listbox", None)
+        if scheduled_box is not None:
+            selected = set(self.settings.scheduled_company_names)
+            scheduled_box.delete(0, tk.END)
+            for index, company in enumerate(self.companies):
+                name = str(company.get("name") or "Unnamed")
+                scheduled_box.insert(tk.END, name)
+                if name in selected:
+                    scheduled_box.selection_set(index)
         try:
             self._update_company_selectors()
         except Exception:
@@ -2669,16 +3316,32 @@ class MainWindow(tk.Tk):
         self._refresh_companies_list()
 
 
+def show_fatal_error(title: str, message: str):
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror(title, message)
+        root.destroy()
+    except Exception:
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(0, str(message), str(title), 0x10)
+        except Exception:
+            pass
+
+
 def launch():
-    app = MainWindow()
-    style = ttk.Style(app)
-    # The native Windows theme ('vista'/'winnative') draws column headings
-    # via the OS header control, which has a fixed single-line height that
-    # clips any second line regardless of padding. 'clam' draws headings
-    # itself and actually expands to fit multi-line text - needed for the
-    # Employees tab's full v2 column set, several of which use \n headers.
-    if "clam" in style.theme_names():
-        style.theme_use("clam")
-    style.configure("Treeview", rowheight=24)
-    style.configure("Treeview.Heading", padding=(6, 8, 6, 8))
-    app.mainloop()
+    try:
+        app = MainWindow()
+        style = ttk.Style(app)
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+        style.configure("Treeview", rowheight=24)
+        style.configure("Treeview.Heading", padding=(6, 8, 6, 8))
+        app.mainloop()
+    except Exception as exc:
+        import traceback
+        tb = traceback.format_exc()
+        show_fatal_error("Startup Error - Torn Company Assistant", f"An error occurred on startup:\n\n{exc}\n\nDetails:\n{tb}")

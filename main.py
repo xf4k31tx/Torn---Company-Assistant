@@ -5,6 +5,7 @@ Knotty Oil Tracker - entry point.
 Usage:
     python main.py                     # launch the desktop GUI
     python main.py --snapshot          # run one snapshot headlessly (e.g. from cron/Task Scheduler) and exit
+    python main.py --scheduled-daily-income  # update rolling company-income data only when stale
     python main.py --employee-efficiency  # run one employee-efficiency pass headlessly and exit
     python main.py --everything        # run a snapshot + an employee-efficiency pass headlessly and exit
     python main.py --resort-history    # one-time: re-sort existing history rows to newest-first and exit
@@ -35,7 +36,24 @@ def _load_companies_or_legacy(settings):
 
 
 def main():
-    if "--snapshot" in sys.argv:
+    if "--scheduled-daily-income" in sys.argv:
+        from app.config import Settings
+        from app.scheduled_collection import run_scheduled_collection
+
+        settings = Settings.load()
+        companies, _came_from_store = _load_companies_or_legacy(settings)
+        if not companies:
+            print("No companies configured. Add at least one company in Settings.")
+            sys.exit(1)
+        exit_code, results = run_scheduled_collection(
+            companies, settings, persist=_came_from_store
+        )
+        for name, result in results:
+            print(f"[{name}] {result.message}")
+        if not results:
+            print(settings.scheduled_last_result or "Scheduled collection is disabled.")
+        sys.exit(exit_code)
+    elif "--snapshot" in sys.argv:
         from app.collector import run_company_snapshots
         from app.config import Settings
 

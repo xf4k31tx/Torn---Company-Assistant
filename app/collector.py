@@ -12,7 +12,8 @@ Two independent run paths, plus a convenience wrapper that runs both:
     employee (ported from the standalone Employee Calculator's
     efficiency_calc.py) + capacity/priority-constrained assignment +
     misplaced-employee flagging + wage efficiency, writing
-    Employee_Effectiveness, Position_Efficiency, Employee_Turnover_Log.
+    Employee_Effectiveness, Position_Efficiency, Total_Effectiveness_Projections,
+    Employee_Turnover_Log.
   - run_everything(): both, in sequence.
 
 Each Collector is scoped to one company dict (as stored by app/companies.py)
@@ -33,6 +34,15 @@ Note on avg_daily_profit_7day: rolling average of daily_profit across all
 snapshots taken within the current Torn week (Sunday 18:00 UTC -> the
 following Sunday 18:00 UTC). It updates with every snapshot during the
 week rather than only being computed once the week is over.
+
+Note on monthly_income/monthly_profit: rolling 30-day TRAILING TOTAL (sum,
+not average) of daily_income/daily_profit across every snapshot in the 30
+days immediately preceding and including the current one - see
+app/profit_calc.py's compute_rolling_30day_sum. Unlike
+avg_daily_profit_7day above, this is NOT anchored to any fixed calendar
+week/month boundary; it continuously updates with every snapshot, mirroring
+weekly_income/weekly_profit's "total over a period" semantics at 30-day
+granularity.
 
 Note on the same-24h-period check (_is_same_24h_period): a Snapshot only
 appends a new history row if it falls in a different fixed 18:00 UTC ->
@@ -60,10 +70,24 @@ from typing import Optional
 
 from .config import Settings
 from .efficiency_calc import (
-    EMPLOYEE_HEADERS, assign_positions, build_position_efficiency_rows, compute_employee_rows,
+    EMPLOYEE_HEADERS, assign_positions, build_position_efficiency_rows,
+    build_total_effectiveness_projection_rows, compute_employee_rows,
     find_company_type_block,
 )
-from .profit_calc import compute_avg_daily_income_7day, compute_avg_daily_profit_7day, compute_row_profit_fields
+from .profit_calc import (
+    compute_avg_daily_income_7day, compute_avg_daily_profit_7day,
+    compute_monthly_income, compute_monthly_profit, compute_row_profit_fields,
+)
+from .income_tracking import (
+    HISTORY_PERIODS, INCOME_HISTORY_HEADERS, SECONDS_PER_DAY,
+    STAR_INCOME_SUMMARY_HEADERS, merge_income_observations,
+    own_company_metrics, reporting_period_start, rolling_company_totals,
+    summarize_star_ranges,
+)
+from .ranking_calc import (
+    compute_star_band_metrics, count_10_star_companies, find_rank,
+    is_weekly_star_reset_snapshot, rank_companies_by_weekly_income,
+)
 from .sheets_client import SheetsClient
 from .torn_api import TornAPI, TornAPIError
 from .tornstats_api import TornStatsAPI, TornStatsAPIError
@@ -77,8 +101,21 @@ COMPANY_HISTORY_HEADERS = [
     "upgrade_storage_size", "upgrade_storage_space", "total_wage",
     "avg_employee_effectiveness", "daily_stockcost",
     "avg_daily_profit_7day", "avg_daily_income_7day",
+    "monthly_income", "monthly_profit",
     "rank_by_income", "rank_total_in_type", "rank_percentile", "rank_trend",
+    "star_10_count", "income_to_reach_10_star", "income_buffer_before_9_star",
+    "income_to_reach_next_star", "required_weekly_income_to_star_up",
+    "income_to_drop_to_previous_star",
+    "rolling_7day_income", "rolling_7day_coverage", "rolling_7day_change",
+    "observed_range_position_percent", "observed_drop_buffer",
+    "observed_next_star_gap",
 ]
+
+COMPANY_RANKINGS_HEADERS = [
+    "rank", "id", "name", "rating", "daily_income", "weekly_income", "is_own_company",
+]
+
+STAR_INCOME_SUMMARY_HISTORY_HEADERS = ["week_start"] + STAR_INCOME_SUMMARY_HEADERS
 
 EMPLOYEES_HEADERS = [
     "tId", "name", "position", "wage", "days_in_company", "last_action_ts",
@@ -102,8 +139,7 @@ EMPLOYEE_EFFECTIVENESS_HEADERS = EMPLOYEE_HEADERS + [
 
 EMPLOYEE_TURNOVER_LOG_HEADERS = ["timestamp", "date", "tId", "name", "event", "position"]
 
-# Torn's own per-employee effectiveness breakdown keys (this is real, accurate
-# per-employee data straight from the company API - no guessing involved).
+# Torn's own per-employee effectiveness breakdown keys
 EFFECTIVENESS_KEYS = [
     "working_stats", "settled_in", "director_education", "addiction",
     "inactivity", "management", "book", "merits", "total",
@@ -122,6 +158,37 @@ def is_employee_misplaced(row: dict) -> bool:
     )
 
 
+def extract_company_type_info(profile: dict) -> tuple[Optional[int], Optional[str]]:
+    """Extracts (company_type_id, company_type_name) from profile['type']."""
+    type_block = profile.get("type") or profile.get("company_type") or {}
+    if isinstance(type_block, dict):
+        type_id = type_block.get("id")
+        type_name = type_block.get("name")
+        try:
+            type_id_int = int(type_id) if type_id is not None else None
+        except (ValueError, TypeError):
+            type_id_int = None
+        return (type_id_int, str(type_name) if type_name else None)
+    elif isinstance(type_block, (int, str)):
+        try:
+            return (int(type_block), None)
+        except (ValueError, TypeError):
+            pass
+    return None, None
+
+
+def extract_company_id(profile: dict) -> Optional[int]:
+    """Extracts company ID from profile['id']."""
+    cid = profile.get("id") or profile.get("company_id")
+    if cid is not None:
+        try:
+            return int(cid)
+        except (ValueError, TypeError):
+            # pyrefly: ignore [bad-return]
+            return str(cid)
+    return None
+
+
 def _ts_to_date(ts: int) -> str:
     try:
         return datetime.datetime.fromtimestamp(int(ts), tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -129,42 +196,35 @@ def _ts_to_date(ts: int) -> str:
         return ""
 
 
-def _get_24h_period_start(ts: int) -> int:
+def _safe_int_ts(val) -> int:
+    try:
+        return int(float(str(val).replace(",", "").strip()))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _get_24h_period_start(ts) -> int:
     """Start of the fixed 24-hour period (18:00 UTC to 18:00 UTC next day)
-    containing ts, as a UTC timestamp."""
-    dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
-    seconds_today = dt.hour * 3600 + dt.minute * 60 + dt.second
-    period_start_secs = 18 * 3600  # 6pm UTC
-    if seconds_today < period_start_secs:
-        period_ts = ts - seconds_today - (24 * 3600 - period_start_secs)
+    containing ts, returned as an exact integer UTC Unix timestamp."""
+    ts_int = _safe_int_ts(ts)
+    if not ts_int:
+        return 0
+    dt = datetime.datetime.fromtimestamp(ts_int, tz=datetime.timezone.utc)
+    if dt.hour < 18:
+        period_dt = (dt - datetime.timedelta(days=1)).replace(hour=18, minute=0, second=0, microsecond=0)
     else:
-        period_ts = ts - seconds_today + period_start_secs
-    return period_ts
+        period_dt = dt.replace(hour=18, minute=0, second=0, microsecond=0)
+    return int(period_dt.timestamp())
 
 
-def _is_same_24h_period(current_ts: int, last_ts: int) -> bool:
+def _is_same_24h_period(current_ts, last_ts) -> bool:
     """
     True if current_ts and last_ts fall in the same fixed 18:00 UTC -> 18:00
     UTC period.
-
-    This is a deliberate, explicit design choice: hard-anchor the "same
-    period" check to Torn's 18:00 UTC day boundary (matching the Torn week
-    boundary used by profit_calc.torn_week_window), rather than a rolling
-    window measured from the actual previous snapshot's timestamp. The
-    tradeoff, and it's a real one: two snapshots only a few hours apart
-    that happen to straddle 18:00 UTC will be classified as "different
-    periods" and both get appended, exactly like a real live-caught case at
-    the old 14:00 UTC boundary (two Company_History rows 13.3 hours apart,
-    split purely because one landed just before 14:00 UTC and the other
-    just after). If that duplicate-row edge case starts showing up in
-    practice, a rolling-window check (any two snapshots < 24h apart are
-    "the same period", regardless of wall-clock time) is the fix - but
-    per explicit instruction this app is using the fixed 18:00 UTC
-    boundary instead, so that "same period" always lines up with Torn's
-    actual day boundary rather than with whenever a snapshot happened to
-    run last.
     """
-    return _get_24h_period_start(current_ts) == _get_24h_period_start(last_ts)
+    start_cur = _get_24h_period_start(current_ts)
+    start_last = _get_24h_period_start(last_ts)
+    return bool(start_cur and start_last and start_cur == start_last)
 
 
 @dataclass
@@ -175,7 +235,30 @@ class SnapshotResult:
     employee_count: int = 0
     stock_count: int = 0
     sheet_url: str = ""
-    is_update: bool = False  # True if we updated existing snapshot, False if we appended new one
+    is_update: bool = False
+
+
+@dataclass
+class HealthScoreResult:
+    rank: Optional[int] = None
+    total_in_type: Optional[int] = None
+    percentile: Optional[float] = None
+    trend: str = ""
+    ranked_companies: list = None  # type: ignore[assignment]
+    star_10_count: Optional[int] = None
+    income_to_reach_10_star: Optional[float] = None
+    income_buffer_before_9_star: Optional[float] = None
+    income_to_reach_next_star: Optional[float] = None
+    required_weekly_income_to_star_up: Optional[float] = None
+    income_to_drop_to_previous_star: Optional[float] = None
+    current_star_level: Optional[int] = None
+    next_star_level: Optional[int] = None
+    previous_star_level: Optional[int] = None
+
+    def __post_init__(self):
+        if self.ranked_companies is None:
+            # pyrefly: ignore [bad-assignment]
+            self.ranked_companies = []
 
 
 @dataclass
@@ -186,10 +269,6 @@ class EmployeeEfficiencyResult:
     employee_count: int = 0
     misplaced_count: int = 0
     sheet_url: str = ""
-    # "" when Tornstats position projections were matched to this company
-    # via the authoritative company-type-id check; otherwise a short
-    # human-readable warning that a fallback match was used instead (or
-    # that no match was found at all) - see efficiency_calc.compute_employee_rows.
     verification_note: str = ""
 
 
@@ -208,17 +287,6 @@ class EverythingResult:
 
 
 class Collector:
-    """Scoped to one company dict, as stored/returned by app/companies.py's
-    load_companies()/save_companies(). torn_api_key/tornstats_api_key fall
-    back to base_settings if the company doesn't override them.
-
-    Mutates self.company in place when it resolves a new Google Sheet ID
-    (auto-create) or a new Company Health Score rank - callers that loop
-    over several companies are responsible for calling
-    app.companies.save_companies(companies) once after the loop, the same
-    pattern used by the module-level run_*_for_companies() helpers below.
-    """
-
     def __init__(self, company: dict, base_settings: Optional[Settings] = None):
         self.company = company
         self.base_settings = base_settings or Settings.load()
@@ -231,9 +299,10 @@ class Collector:
         return (self.company.get("torn_api_key") or self.base_settings.torn_api_key or "").strip()
 
     def _public_key(self) -> str:
-        """Public API key for Rankings only - falls back to the
-        Limited-Access key if no Public key is configured for this company."""
-        return (self.company.get("torn_public_api_key") or "").strip() or self._torn_key()
+        pub_key = (self.company.get("torn_public_api_key") or "").strip()
+        if pub_key:
+            return pub_key
+        return self._torn_key()
 
     def _tornstats_key(self) -> str:
         return (self.company.get("tornstats_api_key") or self.base_settings.tornstats_api_key or "").strip()
@@ -248,46 +317,46 @@ class Collector:
                 self.company["google_sheet_name"] = self.name
         return sheets
 
-    def _compute_health_score(self, profile: dict, own_weekly_income: float):
-        """
-        Rank of this company's weekly income against every other company of
-        the same type (v2/company/{type_id}/companies, paginated 100 at a
-        time). Returns (rank, total_in_type, percentile, trend) where trend
-        is "up"/"down"/"same"/"" (empty the first time, since there's no
-        prior last_rank to compare against yet).
+    def _compute_health_score(self, profile: dict, own_weekly_income: float, timestamp: int) -> HealthScoreResult:
+        company_type, _ = extract_company_type_info(profile)
+        own_id = extract_company_id(profile)
+        if not company_type or not own_id:
+            return HealthScoreResult()
 
-        Non-fatal: any failure (bad Public key, network error, own company
-        not found in the listing, etc.) just returns all-blank so the rest
-        of the snapshot still gets written. Persists the new rank onto
-        self.company["last_rank"] on success.
-        """
-        company_type = (profile.get("type") or {}).get("id")
-        own_id = profile.get("id")
-        if not company_type or own_id is None:
-            return None, None, None, ""
+        pub_key = (self.company.get("torn_public_api_key") or "").strip()
+        primary_key = pub_key if pub_key else self._torn_key()
+
         try:
-            torn_public = TornAPI(api_key=self._public_key())
-            all_companies = []
-            offset = 0
-            limit = 100
-            while True:
-                resp = torn_public.get_company_listings(company_type, offset=offset, limit=limit)
-                batch = resp.get("companies", []) or []
-                all_companies.extend(batch)
-                total = (resp.get("_metadata") or {}).get("total", len(all_companies))
-                offset += limit
-                if offset >= total or not batch:
-                    break
+            torn_public = TornAPI(api_key=primary_key)
+            all_companies = torn_public.get_all_company_listings(company_type)
+        except Exception as err:
+            if pub_key and pub_key != self._torn_key():
+                try:
+                    torn_public = TornAPI(api_key=self._torn_key())
+                    all_companies = torn_public.get_all_company_listings(company_type)
+                except Exception as fallback_err:
+                    import logging
+                    logging.warning(
+                        f"Health score computation failed for {self.name}: {fallback_err} "
+                        f"(company_type={company_type!r}, own_id={own_id!r}, "
+                        f"used_public_key={bool(pub_key)}, fallback_to_torn_key=True)"
+                    )
+                    return HealthScoreResult()
+            else:
+                import logging
+                logging.warning(
+                    f"Health score computation failed for {self.name}: {err} "
+                    f"(company_type={company_type!r}, own_id={own_id!r}, "
+                    f"used_public_key={bool(pub_key)}, fallback_to_torn_key=False)"
+                )
+                return HealthScoreResult()
 
-            ranked = sorted(
-                all_companies,
-                key=lambda c: (c.get("income") or {}).get("weekly", 0) or 0,
-                reverse=True,
-            )
+        try:
+            ranked = rank_companies_by_weekly_income(all_companies)
             total_n = len(ranked)
-            rank = next((i + 1 for i, c in enumerate(ranked) if c.get("id") == own_id), None)
+            rank = find_rank(ranked, own_id)
             if rank is None or not total_n:
-                return None, total_n or None, None, ""
+                return HealthScoreResult(total_in_type=total_n or None, ranked_companies=ranked)
 
             percentile = round((total_n - rank + 1) / total_n * 100, 1)
 
@@ -300,11 +369,145 @@ class Collector:
                 trend = "down"
             else:
                 trend = "same"
-
             self.company["last_rank"] = rank
-            return rank, total_n, percentile, trend
-        except Exception:
-            return None, None, None, ""
+
+            star_10_count = count_10_star_companies(ranked)
+            self.company["star_10_count"] = star_10_count
+
+            cohort = compute_star_band_metrics(
+                ranked, own_id, own_weekly_income, profile.get("rating")
+            )
+
+            return HealthScoreResult(
+                rank=rank, total_in_type=total_n, percentile=percentile, trend=trend,
+                ranked_companies=ranked, star_10_count=star_10_count,
+                income_to_reach_10_star=cohort["income_to_reach_next_star"],
+                income_buffer_before_9_star=cohort["income_to_drop_to_previous_star"],
+                income_to_reach_next_star=cohort["income_to_reach_next_star"],
+                required_weekly_income_to_star_up=cohort[
+                    "required_weekly_income_to_star_up"
+                ],
+                income_to_drop_to_previous_star=cohort[
+                    "income_to_drop_to_previous_star"
+                ],
+                current_star_level=cohort["current_star_level"],
+                next_star_level=cohort["next_star_level"],
+                previous_star_level=cohort["previous_star_level"],
+            )
+        except Exception as exc:
+            import logging
+            logging.warning(f"Health score calculation error for {self.name}: {exc}")
+            return HealthScoreResult()
+
+    def _update_income_tracking(
+        self,
+        sheets: SheetsClient,
+        ranked_companies: list[dict],
+        own_id,
+        timestamp: int,
+    ) -> dict:
+        prior = sheets.read_records("Company_Income_History")
+        history = merge_income_observations(
+            prior, ranked_companies, timestamp, own_id=own_id
+        )
+        sheets.overwrite_current_state(
+            "Company_Income_History", INCOME_HISTORY_HEADERS, history
+        )
+
+        period = reporting_period_start(timestamp)
+        totals = rolling_company_totals(history, period)
+        summaries = summarize_star_ranges(totals, timestamp)
+        sheets.overwrite_current_state(
+            "Star_Income_Summary", STAR_INCOME_SUMMARY_HEADERS, summaries
+        )
+
+        if is_weekly_star_reset_snapshot(timestamp):
+            completed_period = period - SECONDS_PER_DAY
+            completed_totals = rolling_company_totals(history, completed_period)
+            live_by_id = {
+                str(company.get("id")): company for company in ranked_companies
+            }
+            for company_id, total in completed_totals.items():
+                live = live_by_id.get(str(company_id))
+                if live:
+                    total["rating"] = float(live.get("rating") or 0)
+                    total["is_own_company"] = str(live.get("id")) == str(own_id)
+            completed = summarize_star_ranges(completed_totals, timestamp)
+            prior_weekly = sheets.read_records("Star_Income_Summary_History")
+            weekly_by_key = {}
+            cutoff = period - HISTORY_PERIODS * SECONDS_PER_DAY
+            for row in prior_weekly:
+                week_start = _safe_int_ts(row.get("week_start"))
+                stars = row.get("stars")
+                if week_start >= cutoff and stars not in (None, ""):
+                    weekly_by_key[(week_start, str(stars))] = dict(row)
+            for row in completed:
+                weekly_row = {"week_start": period, **row}
+                weekly_by_key[(period, str(row["stars"]))] = weekly_row
+            weekly_rows = sorted(
+                weekly_by_key.values(),
+                key=lambda row: (
+                    -_safe_int_ts(row.get("week_start")),
+                    -_safe_int_ts(row.get("stars")),
+                ),
+            )
+            sheets.overwrite_current_state(
+                "Star_Income_Summary_History",
+                STAR_INCOME_SUMMARY_HISTORY_HEADERS,
+                weekly_rows,
+            )
+
+        return own_company_metrics(totals, summaries)
+
+    def run_daily_income(self) -> SnapshotResult:
+        torn_key = self._torn_key()
+        if not torn_key:
+            return SnapshotResult(False, "No Torn API key configured. Add one in Settings.")
+        torn = TornAPI(api_key=torn_key)
+        try:
+            profile = torn.get_company_profile_v2().get("profile", {}) or {}
+            timestamp = int(
+                torn.get_company_timestamp_v2().get("timestamp", time.time())
+            )
+        except TornAPIError as exc:
+            return SnapshotResult(False, f"Torn API error: {exc.message}")
+        except Exception as exc:
+            return SnapshotResult(False, f"Could not reach Torn API: {exc}")
+
+        try:
+            sheets = self._sheets()
+        except Exception as exc:
+            return SnapshotResult(False, f"Sheets setup failed: {exc}")
+
+        weekly_income = float(
+            ((profile.get("income") or {}).get("weekly", 0)) or 0
+        )
+        health = self._compute_health_score(profile, weekly_income, timestamp)
+        own_id = extract_company_id(profile)
+        self._update_income_tracking(
+            sheets, health.ranked_companies, own_id, timestamp
+        )
+        ranking_rows = [
+            {
+                "rank": index + 1,
+                "id": company.get("id", ""),
+                "name": company.get("name", ""),
+                "rating": company.get("rating", ""),
+                "daily_income": (company.get("income") or {}).get("daily", ""),
+                "weekly_income": (company.get("income") or {}).get("weekly", ""),
+                "is_own_company": str(company.get("id")) == str(own_id),
+            }
+            for index, company in enumerate(health.ranked_companies)
+        ]
+        sheets.overwrite_current_state(
+            "Company_Rankings", COMPANY_RANKINGS_HEADERS, ranking_rows
+        )
+        return SnapshotResult(
+            True,
+            "Daily income collection complete.",
+            company_name=profile.get("name", self.name),
+            sheet_url=sheets.url,
+        )
 
     def run_snapshot(self) -> SnapshotResult:
         torn_key = self._torn_key()
@@ -368,10 +571,10 @@ class Collector:
         previous_by_name = {}
         for row in previous_stock_rows:
             rname = row.get("name")
-            ts = int(row.get("timestamp") or 0)
+            ts = _safe_int_ts(row.get("timestamp"))
             if ts >= timestamp:
                 continue
-            if rname not in previous_by_name or ts > int(previous_by_name[rname].get("timestamp", 0)):
+            if rname not in previous_by_name or ts > _safe_int_ts(previous_by_name[rname].get("timestamp")):
                 previous_by_name[rname] = row
 
         daily_stockcost = 0
@@ -394,12 +597,8 @@ class Collector:
                 delta_sold_amount = sold_amount
                 delta_sold_worth = sold_worth
 
-            # created = inventory change + current day sold_amount (YATA formula).
-            # sold_amount is the daily variable amount (not cumulative).
             created = delta_in_stock + sold_amount
 
-            # Stockout predictor: sold_amount is already a daily figure, so
-            # in_stock / sold_amount directly estimates days of runway left.
             if sold_amount > 0:
                 days_until_stockout = round(in_stock / sold_amount, 1)
                 stockout_soon = days_until_stockout <= STOCKOUT_SOON_DAYS
@@ -441,8 +640,22 @@ class Collector:
             current_timestamp=timestamp,
             current_daily_income=daily_income,
         )
+        monthly_income = compute_monthly_income(
+            prior_rows=prior_company_rows,
+            current_timestamp=timestamp,
+            current_daily_income=daily_income,
+        )
+        monthly_profit = compute_monthly_profit(
+            prior_rows=prior_company_rows,
+            current_timestamp=timestamp,
+            current_daily_profit=profit_fields["daily_profit"],
+        )
 
-        rank, rank_total, rank_percentile, rank_trend = self._compute_health_score(profile, weekly_income)
+        health = self._compute_health_score(profile, weekly_income, timestamp)
+        own_id = extract_company_id(profile)
+        income_metrics = self._update_income_tracking(
+            sheets, health.ranked_companies, own_id, timestamp
+        )
 
         employees_block = profile.get("employees", {}) or {}
         customers_block = profile.get("customers", {}) or {}
@@ -466,24 +679,57 @@ class Collector:
             "total_wage": total_wage, "avg_employee_effectiveness": avg_effectiveness,
             "daily_stockcost": round(daily_stockcost, 2),
             "avg_daily_profit_7day": avg_daily_profit_7day, "avg_daily_income_7day": avg_daily_income_7day,
-            "rank_by_income": rank if rank is not None else "",
-            "rank_total_in_type": rank_total if rank_total else "",
-            "rank_percentile": rank_percentile if rank_percentile is not None else "",
-            "rank_trend": rank_trend,
+            "monthly_income": monthly_income, "monthly_profit": monthly_profit,
+            "rank_by_income": health.rank if health.rank is not None else "",
+            "rank_total_in_type": health.total_in_type if health.total_in_type else "",
+            "rank_percentile": health.percentile if health.percentile is not None else "",
+            "rank_trend": health.trend,
+            "star_10_count": health.star_10_count if health.star_10_count is not None else "",
+            "income_to_reach_10_star": (
+                health.income_to_reach_10_star if health.income_to_reach_10_star is not None else ""
+            ),
+            "income_buffer_before_9_star": (
+                health.income_buffer_before_9_star if health.income_buffer_before_9_star is not None else ""
+            ),
+            "income_to_reach_next_star": (
+                health.income_to_reach_next_star
+                if health.income_to_reach_next_star is not None else ""
+            ),
+            "required_weekly_income_to_star_up": (
+                health.required_weekly_income_to_star_up
+                if health.required_weekly_income_to_star_up is not None else ""
+            ),
+            "income_to_drop_to_previous_star": (
+                health.income_to_drop_to_previous_star
+                if health.income_to_drop_to_previous_star is not None else ""
+            ),
+            "rolling_7day_income": (
+                income_metrics.get("rolling_7day_income")
+                if income_metrics.get("rolling_7day_income") is not None else ""
+            ),
+            "rolling_7day_coverage": (
+                f"{income_metrics.get('rolling_7day_coverage', 0)}/7"
+            ),
+            "rolling_7day_change": (
+                income_metrics.get("rolling_7day_change")
+                if income_metrics.get("rolling_7day_change") is not None else ""
+            ),
+            "observed_range_position_percent": (
+                income_metrics.get("observed_range_position_percent")
+                if income_metrics.get("observed_range_position_percent") is not None else ""
+            ),
+            "observed_drop_buffer": (
+                income_metrics.get("observed_drop_buffer")
+                if income_metrics.get("observed_drop_buffer") is not None else ""
+            ),
+            "observed_next_star_gap": (
+                income_metrics.get("observed_next_star_gap")
+                if income_metrics.get("observed_next_star_gap") is not None else ""
+            ),
         }
 
         # ----------------------------------------------- director effic. --
-        # Was previously looping over every block Tornstats returns (every
-        # company type in the game, ~25-30 of them) with no filtering at
-        # all, so Director_Efficiency ended up with rows for Hair Salon, Law
-        # Firm, etc. alongside this company's real numbers. Now matched the
-        # same verified way as the per-employee lookups (company_type id
-        # first, see find_company_type_block) so only this company's block
-        # is ever written - and it's logged to logs/efficiency_verification.log
-        # either way so a mismatch is visible instead of silent.
-        type_block = profile.get("type") or {}
-        director_company_type_id = type_block.get("id")
-        director_company_type_name = type_block.get("name")
+        director_company_type_id, director_company_type_name = extract_company_type_info(profile)
         director_known_positions = {e.get("position", {}).get("name") for e in employees if e.get("position")}
         director_known_positions.discard(None)
 
@@ -507,23 +753,18 @@ class Collector:
                             "position": position, "efficiency": value,
                         })
             except TornStatsAPIError:
-                pass  # non-fatal - company/employee data still gets written
+                pass
             except Exception:
                 pass
 
         # -------------------------------------------------------- write --
         is_same_period = False
         if prior_company_rows:
-            # Find the most recent prior snapshot by timestamp, not by row
-            # position - new rows are inserted at the top of the sheet, so
-            # position no longer implies recency.
-            last_row = max(prior_company_rows, key=lambda r: int(r.get("timestamp") or 0))
-            last_ts = int(last_row.get("timestamp") or 0)
-            is_same_period = _is_same_24h_period(timestamp, last_ts)
+            last_row = max(prior_company_rows, key=lambda r: _safe_int_ts(r.get("timestamp")))
+            last_ts = _safe_int_ts(last_row.get("timestamp"))
+            if last_ts > 0:
+                is_same_period = _is_same_24h_period(timestamp, last_ts)
 
-        # Only append new rows if it's a different 18:00-UTC-to-18:00-UTC
-        # period than the last snapshot. Otherwise we just re-verified the
-        # current data (Employees is refreshed regardless).
         if not is_same_period:
             sheets.append_history_row("Company_History", COMPANY_HISTORY_HEADERS, company_row)
             sheets.append_history_rows("Stock_History", STOCK_HISTORY_HEADERS, stock_rows)
@@ -531,6 +772,20 @@ class Collector:
                 sheets.append_history_rows("Director_Efficiency", DIRECTOR_EFFICIENCY_HEADERS, director_rows)
 
         sheets.overwrite_current_state("Employees", EMPLOYEES_HEADERS, employee_rows)
+
+        ranking_rows = [
+            {
+                "rank": index + 1,
+                "id": c.get("id", ""),
+                "name": c.get("name", ""),
+                "rating": c.get("rating", ""),
+                "daily_income": (c.get("income") or {}).get("daily", ""),
+                "weekly_income": (c.get("income") or {}).get("weekly", ""),
+                "is_own_company": str(c.get("id")) == str(own_id),
+            }
+            for index, c in enumerate(health.ranked_companies)
+        ]
+        sheets.overwrite_current_state("Company_Rankings", COMPANY_RANKINGS_HEADERS, ranking_rows)
 
         return SnapshotResult(
             ok=True,
@@ -569,24 +824,15 @@ class Collector:
         except Exception as e:
             return EmployeeEfficiencyResult(False, f"Sheets setup failed: {e}")
 
-        # Fetched once, up front, so the Tornstats position-efficiency call
-        # below can verify it's reading the right company's block (by
-        # Torn's own company_type id - see efficiency_calc.find_company_type_block)
-        # instead of relying only on the roster's currently-held positions,
-        # and so we no longer need a second profile call later just for
-        # total_capacity.
         total_capacity = None
         company_type_id = None
         company_type_name = None
         try:
             profile = torn.get_company_profile_v2().get("profile", {}) or {}
             total_capacity = (profile.get("employees") or {}).get("capacity")
-            type_block = profile.get("type") or {}
-            company_type_id = type_block.get("id")
-            company_type_name = type_block.get("name")
+            company_type_id, company_type_name = extract_company_type_info(profile)
         except Exception:
-            pass  # non-fatal - assignment runs uncapped, and Tornstats matching
-            # falls back to its older heuristic if the type id/name aren't known
+            pass
 
         rows, position_names, verification_note = compute_employee_rows(
             employees, tornstats,
@@ -594,11 +840,6 @@ class Collector:
             expected_company_type_name=company_type_name,
         )
 
-        # Grow, never shrink, automatically - a position that stops showing
-        # up in this run (e.g. the last person in it just quit) shouldn't
-        # silently disappear from the sheet/GUI's column list. Positions are
-        # only ever removed by an explicit, user-driven action (the Position
-        # Effectiveness tab's "Configure Positions" checklist), never here.
         self.company["last_known_positions"] = sorted(
             set(self.company.get("last_known_positions") or []) | set(position_names)
         )
@@ -638,14 +879,9 @@ class Collector:
         avg_wage_eff = (sum(wage_effs) / len(wage_effs)) if wage_effs else 0
         for row in rows:
             we = row["wage_efficiency"]
-            # Flag anyone paid 50%+ worse (higher wage-per-effectiveness-point)
-            # than the roster average.
             row["wage_efficiency_flag"] = bool(we != "" and avg_wage_eff and we >= avg_wage_eff * 1.5)
 
         # --------------------------------------------------- turnover log --
-        # Employee_Effectiveness is overwritten (current roster only) each
-        # run, so the *previous* roster has to be read before we overwrite
-        # it, and diffed by tId against the new one to log joins/leaves.
         previous_roster = sheets.read_records("Employee_Effectiveness")
         previous_ids = {str(r.get("tId")) for r in previous_roster if r.get("tId") not in (None, "")}
         current_ids = {str(r["tId"]) for r in rows if r.get("tId") not in (None, "")}
@@ -667,16 +903,15 @@ class Collector:
             })
 
         # ------------------------------------------------------- write --
-        # rows already come from efficiency_calc as flat dicts keyed by
-        # EMPLOYEE_HEADERS names (plus misplaced_flag/wage_efficiency/
-        # wage_efficiency_flag added above, plus an internal "projected"
-        # dict that overwrite_current_state simply ignores since it's not
-        # in EMPLOYEE_EFFECTIVENESS_HEADERS).
         sheets.overwrite_current_state("Employee_Effectiveness", EMPLOYEE_EFFECTIVENESS_HEADERS, rows)
 
         pos_headers, pos_rows_list = build_position_efficiency_rows(rows, position_names)
         pos_rows = [dict(zip(pos_headers, r)) for r in pos_rows_list]
         sheets.overwrite_current_state("Position_Efficiency", pos_headers, pos_rows)
+
+        total_headers, total_rows_list = build_total_effectiveness_projection_rows(rows, position_names)
+        total_rows = [dict(zip(total_headers, r)) for r in total_rows_list]
+        sheets.overwrite_current_state("Total_Effectiveness_Projections", total_headers, total_rows)
 
         if turnover_rows:
             sheets.append_history_rows("Employee_Turnover_Log", EMPLOYEE_TURNOVER_LOG_HEADERS, turnover_rows)
@@ -698,50 +933,11 @@ class Collector:
 
 
 def persist_companies(companies: list) -> None:
-    """Persist any in-place mutations (new google_sheet_id from auto-create,
-    new last_rank from the Health Score) back to companies.json/DPAPI store.
-
-    Deliberately NOT called automatically by the run_*_for_companies()
-    helpers below - only call this with a `companies` list that actually
-    came from app.companies.load_companies() (and was passed straight
-    through, mutated in place). Calling it with an ad-hoc/throwaway
-    companies list (e.g. in a test, or a one-off dry run) would silently
-    overwrite the real saved company data with that throwaway data - this
-    is exactly the mistake that happened during Phase 4 development, so
-    persistence is opt-in and the caller's responsibility from here on."""
     from .companies import save_companies
     save_companies(companies)
 
 
 def run_company_snapshots(companies: list, base_settings: Optional[Settings] = None) -> list:
-    """
-    Run one snapshot per company dict and return [(name, SnapshotResult), ...].
-
-    This is the single implementation of "run N companies" shared by the GUI
-    (Settings > Companies) and headless `python main.py --snapshot`, so the
-    two modes can't drift out of sync with each other the way they used to.
-
-    Each company dict may provide: name, torn_api_key, torn_public_api_key,
-    tornstats_api_key, google_sheet_id, google_sheet_name. A blank
-    torn_api_key/tornstats_api_key falls back to base_settings. A blank (or
-    stale/deleted) google_sheet_id auto-creates a new Sheet named exactly
-    the company's name, and the resulting ID is persisted back into
-    companies.json - there is no shared default target sheet, since each
-    company should write to its own Sheet.
-
-    A company with no Torn API key configured (of its own or via
-    base_settings), or one that exactly duplicates an already-queued
-    (torn_api_key, google_sheet_id) pair, is reported back as a failed
-    SnapshotResult with an explanatory message rather than being silently
-    dropped from the run.
-
-    Does NOT persist any in-place mutations (new google_sheet_id, new
-    last_rank) back to disk - call app.collector.persist_companies(companies)
-    afterward, but ONLY if `companies` came from
-    app.companies.load_companies(). Passing an ad-hoc/throwaway companies
-    list into persist_companies() would silently overwrite the real saved
-    data with that throwaway data.
-    """
     base = base_settings or Settings.load()
     results = []
     seen = set()
@@ -753,9 +949,6 @@ def run_company_snapshots(companies: list, base_settings: Optional[Settings] = N
             continue
 
         sheet_id = (comp.get("google_sheet_id") or "").strip()
-        # Only dedupe when there's an explicit Sheet ID to collide on - a
-        # blank ID always auto-creates its own fresh Sheet, so there's
-        # nothing to dedupe against.
         if sheet_id:
             dedupe_key = (torn_key, sheet_id)
             if dedupe_key in seen:
@@ -770,11 +963,19 @@ def run_company_snapshots(companies: list, base_settings: Optional[Settings] = N
     return results
 
 
+def run_daily_income_for_companies(
+    companies: list,
+    base_settings: Optional[Settings] = None,
+) -> list:
+    base = base_settings or Settings.load()
+    results = []
+    for comp in companies:
+        name = comp.get("name") or "Unnamed"
+        results.append((name, Collector(comp, base_settings=base).run_daily_income()))
+    return results
+
+
 def run_employee_efficiency_for_companies(companies: list, base_settings: Optional[Settings] = None) -> list:
-    """Run one employee-efficiency pass per company dict and return
-    [(name, EmployeeEfficiencyResult), ...]. Mirrors run_company_snapshots'
-    shape. Does NOT persist - call app.collector.persist_companies(companies)
-    afterward if `companies` came from app.companies.load_companies()."""
     base = base_settings or Settings.load()
     results = []
     for comp in companies:
@@ -784,10 +985,6 @@ def run_employee_efficiency_for_companies(companies: list, base_settings: Option
 
 
 def run_everything_for_companies(companies: list, base_settings: Optional[Settings] = None) -> list:
-    """Run both a snapshot and an employee-efficiency pass per company dict
-    and return [(name, EverythingResult), ...]. Does NOT persist - call
-    app.collector.persist_companies(companies) afterward if `companies`
-    came from app.companies.load_companies()."""
     base = base_settings or Settings.load()
     results = []
     for comp in companies:
@@ -796,18 +993,10 @@ def run_everything_for_companies(companies: list, base_settings: Optional[Settin
     return results
 
 
-# The append-only history tabs that get newest-snapshot-first ordering.
-# Employees and Employee_Effectiveness/Position_Efficiency are deliberately
-# excluded - they're overwritten wholesale each run (current roster only),
-# so there's no "order" to fix there.
 HISTORY_TABS = ["Company_History", "Stock_History", "Director_Efficiency", "Employee_Turnover_Log"]
 
 
 def resort_existing_history(companies: list, base_settings: Optional[Settings] = None) -> list:
-    """One-time migration: re-sort each configured company's existing
-    history rows into newest-first order (matching how new snapshots are
-    now written). Returns [(company_name, {tab_name: row_count_or_None}), ...]
-    - row_count is None if that company's Sheet couldn't be reached at all."""
     base = base_settings or Settings.load()
     results = []
     for comp in companies:
@@ -826,6 +1015,8 @@ def resort_existing_history(companies: list, base_settings: Optional[Settings] =
             try:
                 per_tab[tab] = sheets.sort_history_newest_first(tab)
             except Exception:
+                # pyrefly: ignore [unsupported-operation]
                 per_tab[tab] = None
+        # pyrefly: ignore [bad-argument-type]
         results.append((name, per_tab))
     return results

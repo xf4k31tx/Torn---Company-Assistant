@@ -46,12 +46,21 @@ class TestCollectorSnapshot:
         company_row = mock_sheets._tabs["Company_History"][0]
         assert company_row["total_wage"] == "572000"
         assert float(company_row["avg_employee_effectiveness"]) == pytest.approx(76.6)
+        # No prior Company_History rows seeded, so the trailing-30-day sums
+        # collapse to exactly this single snapshot's daily figures.
+        assert float(company_row["monthly_income"]) == pytest.approx(float(company_row["daily_income"]))
+        assert float(company_row["monthly_profit"]) == pytest.approx(float(company_row["daily_profit"]))
 
     def test_health_score_computed(self, all_patched, mock_sheets: MockSheetsClient,
                                     test_settings, test_company):
-        """Own company (id 220001, weekly income 29,750,000) ranks 2nd of 3
-        in the mock listings fixture (Quick Lube 40M > Knotty Oil 29.75M >
-        Oil Express 15M) - fully deterministic given the fixed mock data."""
+        """Own company (id 220001, weekly income 29,750,000) ranks 7th of
+        14 in the mock listings fixture (spread across 2 pages, joined via
+        _metadata.links.next) - fully deterministic given the fixed mock
+        data. Also covers the 10-star cohort numbers: 5 companies rated
+        10.0 (ranks 1-5), own company outside that cohort, so
+        income_to_reach_10_star = rank-5's weekly income (35,000,000) minus
+        own weekly income (29,750,000) = 5,250,000. The current
+        10-star count is refreshed and persisted on every daily snapshot."""
         from app.collector import Collector
 
         collector = Collector(test_company, base_settings=test_settings)
@@ -59,10 +68,89 @@ class TestCollectorSnapshot:
 
         assert result.ok is True
         row = mock_sheets._tabs["Company_History"][0]
-        assert row["rank_by_income"] == "2"
-        assert row["rank_total_in_type"] == "3"
-        assert float(row["rank_percentile"]) == pytest.approx(66.7, abs=0.1)
-        assert collector.company["last_rank"] == 2  # persisted onto the company dict in-place
+        assert row["rank_by_income"] == "7"
+        assert row["rank_total_in_type"] == "14"
+        assert float(row["rank_percentile"]) == pytest.approx((14 - 7 + 1) / 14 * 100, abs=0.1)
+        assert collector.company["last_rank"] == 7  # persisted onto the company dict in-place
+
+        assert row["star_10_count"] == "5"
+        assert float(row["income_to_reach_10_star"]) == pytest.approx(5250000)
+        assert float(row["income_buffer_before_9_star"]) == pytest.approx(5750000)
+        assert float(row["income_to_reach_next_star"]) == pytest.approx(5250000)
+        assert float(row["required_weekly_income_to_star_up"]) == pytest.approx(35000000)
+        assert float(row["income_to_drop_to_previous_star"]) == pytest.approx(5750000)
+        assert collector.company["star_10_count"] == 5
+
+        # Full same-type listing persisted to its own current-state tab, not
+        # just the 4-ish scalar Company_History fields.
+        assert "Company_Rankings" in mock_sheets._tabs
+        ranking_rows = mock_sheets._tabs["Company_Rankings"]
+        assert len(ranking_rows) == 14
+        assert ranking_rows[0]["rank"] == "1"
+        assert ranking_rows[0]["name"] == "Titan Oil"
+        own_row = next(r for r in ranking_rows if r["is_own_company"] == "True")
+        assert own_row["rank"] == "7"
+        assert own_row["name"] == "Knotty Oil Co"
+        assert own_row["weekly_income"] == "29750000"
+        assert own_row["daily_income"] == "4250000"
+
+    def test_health_score_pagination_follows_next_link(self, all_patched, mock_sheets: MockSheetsClient,
+                                                         test_settings, test_company, mock_torn):
+        """Confirms all 14 companies are actually returned when the fixture
+        forces multiple pages (page_size=9, splitting into 9 + 5) - and,
+        critically, that pagination goes through get_company_listings()
+        again with a reissued offset rather than GETting Torn's own `next`
+        link directly, since that link has a confirmed live bug (missing
+        the /{type_id} path segment - see
+        TornAPI.get_all_company_listings' docstring). fetch_url must NOT be
+        called at all here."""
+        companies = mock_torn.get_all_company_listings(12, page_size=9)
+
+        assert len(companies) == 14  # both pages merged
+        assert {c["id"] for c in companies} == {
+            220101, 220102, 220103, 220104, 220105, 220106, 220001, 220107,
+            220108, 220109, 220110, 220111, 220112, 220100,
+        }
+        listing_calls = [c for c in mock_torn.calls if c.method == "get_company_listings"]
+        assert len(listing_calls) == 2
+        assert listing_calls[0].args == (12, 0, 9)  # company_type_id, offset, limit
+        assert listing_calls[1].args == (12, 9, 9)  # offset correctly reissued, not GETting next's own path
+        fetch_url_calls = [c for c in mock_torn.calls if c.method == "fetch_url"]
+        assert fetch_url_calls == []  # the buggy next link must never be GETted directly
+
+    def test_star_10_count_refreshes_on_daily_snapshot(
+        self, all_patched, mock_sheets: MockSheetsClient,
+        test_settings, test_company, mock_torn,
+    ):
+        """Every daily snapshot refreshes the count from the live listing."""
+        from app.collector import Collector
+
+        test_company["star_10_count"] = 3
+
+        collector = Collector(test_company, base_settings=test_settings)
+        collector.run_snapshot()
+
+        row = mock_sheets._tabs["Company_History"][0]
+        assert row["star_10_count"] == "5"
+        assert collector.company["star_10_count"] == 5
+
+    def test_star_10_count_freshly_captured_on_sunday_reset_snapshot(
+        self, all_patched, mock_sheets: MockSheetsClient, test_settings, test_company, mock_torn,
+    ):
+        """Sunday snapshots also refresh and persist the live count."""
+        from app.collector import Collector
+
+        test_company["star_10_count"] = 1  # stale prior value - must be overwritten
+        import datetime
+        sunday_reset_ts = int(datetime.datetime(2026, 8, 2, 19, 0, tzinfo=datetime.timezone.utc).timestamp())
+        mock_torn._data["get_company_timestamp_v2"]["response"]["timestamp"] = sunday_reset_ts
+
+        collector = Collector(test_company, base_settings=test_settings)
+        collector.run_snapshot()
+
+        row = mock_sheets._tabs["Company_History"][0]
+        assert row["star_10_count"] == "5"  # freshly counted from the listing
+        assert collector.company["star_10_count"] == 5  # persisted, overriding the stale 1
 
     def test_stockout_predictor_flags_low_stock(self, all_patched, mock_sheets: MockSheetsClient,
                                                  test_settings, test_company):
@@ -99,6 +187,31 @@ class TestCollectorSnapshot:
         assert result.is_update is True
         # Same fixed 18:00-UTC period as the seeded row - no new row appended.
         assert len(mock_sheets._tabs["Company_History"]) == 1
+
+    def test_monthly_income_and_profit_accumulate_across_prior_snapshots(self, all_patched,
+                                                                          mock_sheets: MockSheetsClient,
+                                                                          mock_torn: MockTornAPI,
+                                                                          test_settings, test_company):
+        """monthly_income/monthly_profit must SUM this snapshot's daily
+        figures with prior Company_History rows falling within the trailing
+        30 days - not just reflect the current snapshot alone."""
+        from app.collector import Collector
+
+        mock_ts = mock_torn.get_company_timestamp_v2()["timestamp"]
+        prior_ts = mock_ts - 5 * 86400  # 5 days earlier: within the 30-day window, a different 18:00-UTC period
+        mock_sheets.seed_tab("Company_History", [{
+            "timestamp": str(prior_ts), "name": "Knotty Oil Co",
+            "daily_income": "500000", "daily_profit": "100000",
+        }])
+
+        collector = Collector(test_company, base_settings=test_settings)
+        result = collector.run_snapshot()
+
+        assert result.ok is True
+        assert len(mock_sheets._tabs["Company_History"]) == 2  # new row appended, not deduped
+        new_row = mock_sheets._tabs["Company_History"][0]  # newest-first insert order
+        assert float(new_row["monthly_income"]) == pytest.approx(float(new_row["daily_income"]) + 500000)
+        assert float(new_row["monthly_profit"]) == pytest.approx(float(new_row["daily_profit"]) + 100000)
 
     def test_missing_torn_key_returns_error(self, test_settings):
         from app.collector import Collector
@@ -203,6 +316,7 @@ class TestCollectorEmployeeEfficiency:
         assert result.misplaced_count == 4
         assert "Employee_Effectiveness" in mock_sheets._tabs
         assert "Position_Efficiency" in mock_sheets._tabs
+        assert "Total_Effectiveness_Projections" in mock_sheets._tabs
         assert len(mock_sheets._tabs["Employee_Effectiveness"]) == 5
 
         director_row = next(r for r in mock_sheets._tabs["Employee_Effectiveness"] if r["name"] == "JohnKnot")
@@ -221,6 +335,14 @@ class TestCollectorEmployeeEfficiency:
         )
         assert float(position_row["Director"]) == pytest.approx(94.2)
         assert float(position_row["Director"]) != float(director_row["effectiveness_working_stats"])
+
+        # Total Effectiveness Projections: same base 94.2 plus this employee's
+        # non-work-stats delta (effectiveness_total - effectiveness_working_stats).
+        total_row = next(
+            r for r in mock_sheets._tabs["Total_Effectiveness_Projections"] if r["name"] == "JohnKnot"
+        )
+        expected_delta = float(director_row["effectiveness_total"]) - float(director_row["effectiveness_working_stats"])
+        assert float(total_row["Director"]) == pytest.approx(94.2 + expected_delta)
 
         courier_row = next(r for r in mock_sheets._tabs["Employee_Effectiveness"] if r["name"] == "OilHand42")
         assert courier_row["misplaced_flag"] == "True"
@@ -441,3 +563,45 @@ class TestPersistCompanies:
         with mock_patch("app.companies.save_companies") as mock_save:
             persist_companies(companies)
             mock_save.assert_called_once_with(companies)
+
+
+def test_snapshot_writes_daily_income_history_and_star_summary(
+    all_patched, mock_sheets, test_settings, test_company,
+):
+    from app.collector import Collector
+
+    result = Collector(test_company, base_settings=test_settings).run_snapshot()
+
+    assert result.ok is True
+    history = mock_sheets.get_tab("Company_Income_History")
+    assert len(history) == 14
+    assert len({(row["company_id"], row["period_start"]) for row in history}) == 14
+    summary = mock_sheets.get_tab("Star_Income_Summary")
+    assert summary
+    ten_star = next(row for row in summary if row["stars"] == "10")
+    assert ten_star["total_count"] == "5"
+    assert ten_star["eligible_count"] == "5"
+    assert ten_star["coverage"] == "5/5"
+    assert float(ten_star["minimum"]) > 0
+    assert float(ten_star["p10"]) > 0
+    assert float(ten_star["median"]) > 0
+    assert float(ten_star["p90"]) > 0
+    assert float(ten_star["maximum"]) > 0
+
+
+def test_daily_income_run_avoids_employee_and_stock_endpoints(
+    all_patched, mock_sheets, mock_torn, test_settings, test_company,
+):
+    from app.collector import Collector
+
+    result = Collector(test_company, base_settings=test_settings).run_daily_income()
+
+    assert result.ok is True
+    called = {call.method for call in mock_torn.calls}
+    assert "get_company_profile_v2" in called
+    assert "get_company_timestamp_v2" in called
+    assert "get_company_listings" in called
+    assert "get_company_employees" not in called
+    assert "get_company_stock_v2" not in called
+    assert "Company_Income_History" in mock_sheets._tabs
+    assert "Star_Income_Summary" in mock_sheets._tabs

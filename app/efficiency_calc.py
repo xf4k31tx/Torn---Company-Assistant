@@ -403,3 +403,51 @@ def build_position_efficiency_rows(rows: List[dict], position_names: List[str]) 
             + [projected.get(pos, "") for pos in position_names]
         )
     return headers, out
+
+
+def build_total_effectiveness_projection_rows(
+    rows: List[dict], position_names: List[str]
+) -> Tuple[List[str], List[list]]:
+    """Wide-format table, same shape as build_position_efficiency_rows, but
+    each cell is the "Total Effectiveness Projection" for that employee at
+    that position rather than the bare Tornstats base projection:
+
+        Total Projection[position] = Base Projection[position]
+                                      + (effectiveness_total - effectiveness_working_stats)
+
+    effectiveness_total is documented by Torn as the sum of all 8
+    effectiveness components (working_stats, settled_in, director_education,
+    addiction, inactivity, management, book, merits) for the employee's
+    *current* position, so (effectiveness_total - effectiveness_working_stats)
+    is exactly the sum of the other 7 non-work-stats components - the part
+    of an employee's real effectiveness that isn't explained by raw work
+    stats alone. Adding that delta on top of a position's base (work-stats-
+    only) projection estimates what the employee's effectiveness would look
+    like at THAT position once those same non-work-stats factors apply.
+
+    A cell is left blank ("") whenever there's no base projection for that
+    employee/position (no Tornstats value at all) - there's nothing
+    meaningful to add the delta to in that case, same convention as
+    build_position_efficiency_rows leaving ungraded cells blank rather than
+    treating a missing projection as 0."""
+    headers = ["tId", "name", "current_position"] + position_names
+    out = []
+    for row in rows:
+        projected = row.get("projected", {})
+        try:
+            delta = float(row.get("effectiveness_total") or 0) - float(row.get("effectiveness_working_stats") or 0)
+        except (TypeError, ValueError):
+            delta = 0
+        cells = []
+        for pos in position_names:
+            base = projected.get(pos, "")
+            if base == "" or base is None:
+                cells.append("")
+                continue
+            try:
+                # pyrefly: ignore [bad-argument-type]
+                cells.append(float(base) + delta)
+            except (TypeError, ValueError):
+                cells.append("")
+        out.append([row["tId"], row["name"], row["current_position"]] + cells)
+    return headers, out

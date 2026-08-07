@@ -23,6 +23,11 @@ class Settings:
     snapshot_interval_minutes: int = 30
     last_selected_company: str = ""
     employee_visible_columns: list[str] = field(default_factory=list)
+    scheduled_collection_enabled: bool = False
+    scheduled_company_names: list[str] = field(default_factory=list)
+    scheduled_wake_computer: bool = False
+    scheduled_last_run: str = ""
+    scheduled_last_result: str = ""
 
     @classmethod
     def load(cls) -> "Settings":
@@ -51,6 +56,18 @@ class Settings:
         allowed["employee_visible_columns"] = (
             [str(column) for column in columns] if isinstance(columns, list) else []
         )
+        scheduled_names = allowed.get("scheduled_company_names", [])
+        allowed["scheduled_company_names"] = (
+            [str(name) for name in scheduled_names]
+            if isinstance(scheduled_names, list) else []
+        )
+        allowed["scheduled_collection_enabled"] = bool(
+            allowed.get("scheduled_collection_enabled", False)
+        )
+        allowed["scheduled_wake_computer"] = bool(
+            allowed.get("scheduled_wake_computer", False)
+        )
+        # pyrefly: ignore [bad-argument-type]
         return cls(**allowed)
 
     def save(self) -> None:

@@ -30,6 +30,8 @@ All company data now flows through the v2 methods below.
 
 from __future__ import annotations
 
+import re
+import urllib.parse
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -64,10 +66,12 @@ TORN_ERROR_MESSAGES = {
 
 
 class TornAPIError(Exception):
-    def __init__(self, code: int, message: str = ""):
+    def __init__(self, code: int, message: str = "", url: str = ""):
         self.code = code
         self.message = message or TORN_ERROR_MESSAGES.get(code, "Unknown Torn API error")
-        super().__init__(f"Torn API error {code}: {self.message}")
+        self.url = url
+        suffix = f" (url={url})" if url else ""
+        super().__init__(f"Torn API error {code}: {self.message}{suffix}")
 
 
 @dataclass
@@ -82,7 +86,15 @@ class TornAPI:
         resp.raise_for_status()
         data = resp.json()
         if isinstance(data, dict) and "error" in data:
-            raise TornAPIError(int(data["error"].get("code", 0)), data["error"].get("error", ""))
+            # key= is redacted before this ever reaches a log line or
+            # exception message - resp.url is the fully-resolved request
+            # URL (including every query param actually sent), which is
+            # far more useful for diagnosing "Incorrect ID"-type errors
+            # than the caller's un-redacted API key would be.
+            safe_url = re.sub(r"([?&]key=)[^&]*", r"\1REDACTED", resp.url)
+            raise TornAPIError(
+                int(data["error"].get("code", 0)), data["error"].get("error", ""), url=safe_url
+            )
         return data
 
     # ---------------------------------------------------------------- v2 --
@@ -144,10 +156,55 @@ class TornAPI:
 
     def get_company_listings(self, company_type_id: int, offset: int = 0, limit: int = 100) -> dict:
         """Browse all companies of a given type (public directory) - source
-        for the Company Health Score ranking feature."""
+        for the Company Health Score ranking feature. See
+        get_all_company_listings() below for the full pagination loop."""
         return self.v2("company", company_type_id, "companies", extra_params={
             "limit": limit, "offset": offset
         })
+
+    def fetch_url(self, url: str) -> dict:
+        """GET an already-complete URL rather than building one from
+        section/id/selection - key/comment are still attached via _get,
+        same as every other method here. General-purpose; NOT used by
+        get_all_company_listings() below - see that method's docstring for
+        why a confirmed live Torn API bug rules it out for this endpoint's
+        pagination specifically."""
+        return self._get(url, {})
+
+    def get_all_company_listings(self, company_type_id: int, page_size: int = 100) -> list[dict]:
+        """Every company of *company_type_id*.
+
+        v2/company/{type_id}/companies' `_metadata.links.next` has a
+        confirmed live bug (observed 2026-08-05 against a real key): the
+        `next` URL it returns is missing the `/{type_id}` path segment
+        entirely - e.g. ".../v2/company/companies?limit=100&offset=100..."
+        instead of ".../v2/company/28/companies?limit=100&offset=100...".
+        GETting that URL as-is fails with "Torn API error 6: Incorrect ID",
+        since Torn's own server can't resolve a typeless /company/companies
+        path. Page 1 (from get_company_listings, which always builds its
+        own correctly-typed URL) is unaffected - only next-page links are
+        broken.
+
+        Rather than trust the link's PATH, this pulls just the offset/limit
+        query params out of it and reissues the request through
+        get_company_listings() - which always includes the type ID -
+        instead of GETting the link directly. "Torn stopped giving us a
+        next link" (or an empty page) is still what ends the loop; only the
+        page 2+ URL construction is defended against.
+        """
+        all_companies: list[dict] = []
+        resp = self.get_company_listings(company_type_id, limit=page_size)
+        while True:
+            batch = resp.get("companies", []) or []
+            all_companies.extend(batch)
+            next_url = ((resp.get("_metadata") or {}).get("links") or {}).get("next")
+            if not next_url or not batch:
+                break
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(next_url).query)
+            next_offset = int((query.get("offset") or [len(all_companies)])[0])
+            next_limit = int((query.get("limit") or [page_size])[0])
+            resp = self.get_company_listings(company_type_id, offset=next_offset, limit=next_limit)
+        return all_companies
 
     def check_key_info(self) -> dict:
         return self.v1("key", None, selections="info")

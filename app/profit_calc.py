@@ -94,3 +94,45 @@ def compute_avg_daily_profit_7day(prior_rows: Sequence[dict], current_timestamp:
 def compute_avg_daily_income_7day(prior_rows: Sequence[dict], current_timestamp: int,
                                    current_daily_income: float) -> float:
     return compute_rolling_7day_average(prior_rows, current_timestamp, current_daily_income, "daily_income")
+
+
+def compute_rolling_30day_sum(prior_rows: Sequence[dict], current_timestamp: int,
+                               current_value: float, field_name: str) -> float:
+    """
+    Trailing 30-day TOTAL (sum, not average) of `field_name` across every
+    snapshot whose timestamp falls in the 30 days immediately preceding and
+    including current_timestamp - i.e. the window
+    (current_timestamp - 30*86400, current_timestamp], NOT a fixed
+    calendar-month or Torn-week-style window. This continuously updates
+    with every snapshot rather than resetting on any calendar boundary,
+    mirroring weekly_income/weekly_profit's "total over a period" semantics
+    at 30-day granularity (Torn's API has no monthly equivalent of its own,
+    the same reason avg_daily_profit_7day/avg_daily_income_7day above are
+    computed here rather than read from the API).
+
+    prior_rows: existing Company_History records (dicts with at least
+    'timestamp' and field_name), any of which may fall outside the trailing
+    30-day window (or even, in principle, carry a future timestamp) - both
+    are filtered out automatically by the window bounds.
+    """
+    window_start = current_timestamp - 30 * 86400
+    total = current_value
+    for row in prior_rows:
+        ts = int(safe_float(row.get("timestamp")))
+        if ts == current_timestamp:
+            continue
+        if window_start < ts <= current_timestamp:
+            v = row.get(field_name)
+            if v not in (None, ""):
+                total += safe_float(v)
+    return round(total, 2)
+
+
+def compute_monthly_income(prior_rows: Sequence[dict], current_timestamp: int,
+                            current_daily_income: float) -> float:
+    return compute_rolling_30day_sum(prior_rows, current_timestamp, current_daily_income, "daily_income")
+
+
+def compute_monthly_profit(prior_rows: Sequence[dict], current_timestamp: int,
+                            current_daily_profit: float) -> float:
+    return compute_rolling_30day_sum(prior_rows, current_timestamp, current_daily_profit, "daily_profit")

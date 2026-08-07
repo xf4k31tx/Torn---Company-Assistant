@@ -13,20 +13,37 @@ The packaged executable is currently named `Knotty Oil Tracker.exe`.
 ## Main features
 
 - Overview, Employees, Stock & Profit Trends, and Settings top-level tabs.
+  Overview nests a General sub-tab (the original company-metrics summary,
+  including the clickable Health Score row) and a Company Rankings sub-tab.
   Employees nests Employee Overview and a Position Efficiency parent with
   Base Effectiveness Projections and Total Effectiveness Projections sub-tabs.
-  Stock & Profit Trends nests Stock and Company Trends sub-tabs.
+  Stock & Profit Trends nests Stock and Company Trends sub-tabs. A separate
+  Legal menu next to File holds the TOS and Privacy Policy viewers.
 - A synchronized company selector across all data tabs. The last selected
   company persists between sessions.
+- Custom popup windows open centered within the main application window and
+  are reduced to fit its visible bounds instead of appearing elsewhere on the
+  desktop. Repeated clicks focus the existing matching popup instead of opening
+  duplicates; closing it allows that popup to be opened again normally.
+  Directly clickable fields append `(click for more info)` to their
+  visible labels, including Health Score, Star 10 Count, and the Name field in
+  the Position Efficiency grids.
 - Independent Snapshot and Employee Efficiency operations, plus a combined
   Run Everything action.
-- Sortable, filterable Employees grid with persistent custom column choices.
+- Sortable, filterable Employees grid with persistent custom column choices,
+  and info (i) glyphs on every effectiveness column explaining what that
+  field means - both on the grid headers and on the employee info card.
 - Employee current-position locks that reserve those positions before the
   remaining assignment calculation fills available seats.
 - Configurable position capacities and fill-priority order per company.
-- Sortable Position Efficiency grid with configurable visible positions.
-- Stock deltas, stockout estimates, profit history, health scoring, turnover
-  tracking, wage-efficiency flags, and trend charts.
+- Sortable Base and Total Effectiveness Projections grids with configurable
+  visible positions.
+- A per-item Stock sub-tab showing each item's last 7 snapshots (not just the
+  latest), so you can compare against the prior week at a glance.
+- Stock deltas, stockout estimates, daily/weekly/monthly profit history,
+  Company Health Score ranking (with a 5-above/5-below neighbor popup and a
+  full Company Rankings tab), turnover tracking, wage-efficiency flags, and
+  trend charts.
 - Per-user Google OAuth and Windows DPAPI-protected local credentials.
 - Headless commands suitable for Windows Task Scheduler.
 - A separate TCA Checksum Verifier utility so downloaded releases can be
@@ -58,6 +75,23 @@ each position, it selects the highest Tornstats-projected employees who remain
 unassigned, subject to position and company capacity. Hard locks are honored
 even when they exceed a configured capacity, and the run reports a warning.
 
+**Total Effectiveness Projection** (shown on the Total Effectiveness
+Projections sub-tab) extends the Base Effectiveness Projection at every
+position by each employee's own non-work-stats effectiveness:
+
+```text
+Total Projection[position] = Base Projection[position]
+                              + (effectiveness_total - effectiveness_working_stats)
+```
+
+Since Torn documents `effectiveness_total` as the sum of all 8 effectiveness
+components for the employee's current position, that difference is exactly
+the sum of the other 7 (settled in, education, addiction, inactivity,
+management, book, merits) — the part of an employee's real effectiveness
+that raw work stats alone don't explain. A cell is left blank wherever the
+underlying Base Effectiveness Projection is also blank for that
+employee/position.
+
 ## Employees tab
 
 The Employees grid includes:
@@ -77,10 +111,32 @@ The Employees grid includes:
 The **Run Employee Efficiency Now** button is located on this tab beside
 **Refresh**. Position locks and custom column selections are saved immediately.
 
+## Stock tab
+
+The **Stock** sub-tab (under Stock & Profit Trends) shows each stock item's
+last 7 snapshots - current plus the 6 prior days - rather than collapsing to
+a single latest-only row, so you can compare in-stock, sold, cost, price, and
+created counts against the prior week at a glance. Rows are grouped by item
+name with the newest snapshot on top of each item's block. A chart of total
+sold worth over time, below the table, still covers the full snapshot
+history rather than just the 7 rows shown per item.
+
 ## Position Efficiency score colors
 
-The Position Efficiency tab displays rounded Tornstats projection scores in
-individually colored, numerically sortable cells:
+The Base Effectiveness Projections and Total Effectiveness Projections
+sub-tabs (under Employees > Position Efficiency) display rounded projection
+scores in individually colored, numerically sortable cells. Both sub-tabs
+share the same table shape (one row per employee, one column per position)
+and the same score-color bands - the only difference is what each cell
+represents:
+
+- **Base Effectiveness Projections** shows Tornstats' bare work-stats-only
+  projection per position (the `Position_Efficiency` sheet tab).
+- **Total Effectiveness Projections** adds each employee's non-work-stats
+  effectiveness (settled in, education, addiction, inactivity, management,
+  book, merits) on top of that same base projection, for every position
+  (the `Total_Effectiveness_Projections` sheet tab). A cell is blank
+  wherever the underlying base projection is also blank.
 
 | Score | Color |
 | --- | --- |
@@ -91,7 +147,63 @@ individually colored, numerically sortable cells:
 | 129+ | Dark green |
 
 Missing or nonnumeric projections remain neutral. **Configure Positions**
-controls which position columns are visible for the selected company.
+controls which position columns are visible for the selected company, and
+applies to both sub-tabs.
+
+## Company Health Score & Rankings
+
+The **Health Score (rank by income)** row on Overview > General shows the
+company's current rank by weekly income among every other company of the
+same type, its percentile, and whether that rank moved up, down, or stayed
+the same since the last snapshot. Clicking that row opens a popup listing
+the 5 same-type companies immediately above and 5 immediately below the
+company in the current ranking, each with name, rating, and daily/weekly
+income, with the company's own row bolded.
+
+The **Company Rankings** sub-tab (Overview > Company Rankings) shows the
+full same-type ranking. Click any **Rank**, **Name**, **Rating**, **Daily
+Income**, or **Weekly Income** heading to sort that column ascending or
+descending. The company's own summary remains locked above the sortable,
+scrollable list, showing its rank, current income, observed range position,
+weekly-income gaps to the next and previous star levels, and change since
+yesterday. The duplicate Rolling
+7-Day Income and Observed Next-Star Gap displays are intentionally omitted.
+The observed range position and displayed next/previous-star gaps are
+recalculated from the current `Company_Rankings` and `Star_Income_Summary`
+sheets whenever the tab refreshes; stored `Company_History` values are used
+only as a fallback.
+
+Clicking **Star 10 Count** on Overview > General opens a sortable
+**Projected Weekly Income Ranges by Star Level** table. Current star counts define the
+number of slots at each level. Every same-type company is then ordered by
+current Weekly Income, highest to lowest, and those fixed slot counts are
+applied down the ranked list. This means a 9-star company already earning
+inside the top 10-star slot count contributes to the projected 10-star range,
+while the displaced 10-star company falls into the projected 9-star range.
+
+The table shows **Star Level**, **Company Count**, **Minimum Weekly
+Income**, **Median Weekly Income**, **Top Performer Weekly Income**,
+**Companies Included**, **Data Status**, and **Last Updated (UTC)**. P10 and
+P90 remain available in the underlying Sheet data but are intentionally
+hidden from the popup. A **Column Guide** explains how every visible value is
+used. Each fixed 18:10 UTC daily observation uses Torn's current Weekly Income
+value directly, so one successful collection populates the ranges. Completed
+Sunday-to-Sunday summaries are retained for up to 12 weeks.
+
+Overview > General dynamically labels the promotion and demotion fields for
+the selected company's current level, such as **Income to Reach 10 Star** and
+**Income to Drop to 8 Star** for a 9-star company. **Required Weekly Income
+to Star Up** displays the absolute Weekly Income at the last slot of the next
+star band; the income-to-reach value is the remaining gap between the
+company's current Weekly Income and that cutoff. The redundant Observed
+Next-Star Gap and Observed Drop Buffer rows are hidden from General because
+they duplicate the generalized income-to-reach and income-to-drop fields.
+
+These values are **empirical estimates, not Torn's own (unpublished,
+multi-factor) rating formula**. Star counts are refreshed daily but are only
+expected to change following Torn's Sunday rating update. Income ordering and
+projected slot occupants can change throughout the week. Treat every value as
+an income-based performance benchmark, not a guaranteed promotion threshold.
 
 ## Operations
 
@@ -120,12 +232,17 @@ first write.
 
 | Sheet tab | Contents | Write style |
 | --- | --- | --- |
-| `Company_History` | Company profile, financials, staffing, stock cost, seven-day rolling averages, and health-score rank among same-type companies | Append, newest first |
+| `Company_History` | Company profile, financials, staffing, stock cost, rolling averages, health-score rank, generalized next/previous-star gaps, and required Weekly Income to star up | Append, newest first |
 | `Stock_History` | Stock state, changes from the preceding snapshot, sales, and stockout estimates | Append, newest first |
 | `Director_Efficiency` | Tornstats company-wide position-efficiency reference | Append, newest first |
 | `Employees` | Current roster and Torn's per-employee effectiveness breakdown | Replace each Snapshot |
 | `Employee_Effectiveness` | Torn effectiveness, Tornstats projections, best fit, constrained assignment, misplaced flag, wage efficiency, and last-action timestamp | Replace each Employee Efficiency run |
-| `Position_Efficiency` | Wide employee-by-position Tornstats projection matrix used by the Position Efficiency tab | Replace each Employee Efficiency run |
+| `Position_Efficiency` | Wide employee-by-position Tornstats projection matrix used by the Base Effectiveness Projections sub-tab | Replace each Employee Efficiency run |
+| `Total_Effectiveness_Projections` | Wide employee-by-position matrix: each Position_Efficiency base projection plus that employee's non-work-stats effectiveness delta (effectiveness_total − effectiveness_working_stats), used by the Total Effectiveness Projections sub-tab | Replace each Employee Efficiency run |
+| `Company_Rankings` | Every same-type company from the latest Health Score fetch (rank, name, rating, daily/weekly income, and whether it's the director's own company), used by the Company Rankings sub-tab and the Health Score neighbor popup | Replace each Snapshot or scheduled income run |
+| `Company_Income_History` | Per-company daily and Weekly Income observations keyed to fixed 18:10 UTC reporting periods | Replace with the bounded snapshot history |
+| `Star_Income_Summary` | Current rank-slot-based Weekly Income min/P10/median/P90/max range, count, coverage, and freshness for every star level | Replace each Snapshot or scheduled income run |
+| `Star_Income_Summary_History` | Completed Sunday-to-Sunday star-level summaries retained for up to 12 weeks | Replace with bounded weekly history |
 | `Employee_Turnover_Log` | Join and leave events detected by employee ID | Append, newest first |
 
 Existing Sheet headers are extended when new columns are introduced; they are
@@ -219,6 +336,7 @@ After the Windows user has completed Google sign-in once:
 
 ```text
 python main.py --snapshot             # Snapshot every configured company
+python main.py --scheduled-daily-income # Update stale rolling-income data only
 python main.py --employee-efficiency  # Efficiency pass for every company
 python main.py --everything           # Run both operations
 python main.py --resort-history       # One-time newest-first history migration
@@ -227,6 +345,14 @@ python main.py --resort-history       # One-time newest-first history migration
 These commands are suitable for Windows Task Scheduler when run under the same
 Windows account that owns the encrypted credentials. They exit with a nonzero
 status when a company operation fails.
+
+Settings includes an optional **Scheduled Daily Collection** panel. It creates
+a non-admin, per-user Windows task that launches hourly but exits immediately
+unless the current 18:10 UTC reporting period is stale. This avoids duplicate
+collection and daylight-saving-time drift while still producing only one
+daily observation. Users can include all or selected companies, optionally
+wake the computer, run a test, repair the task, and view its last/next run and
+result. No API keys, Google tokens, or Sheet IDs are placed in task arguments.
 
 ## Tests
 
@@ -240,7 +366,14 @@ The tests cover mocked collection and Google Sheet writes, secure settings,
 current-versus-projected effectiveness, misplaced calculations, position
 locks, score bands, warning thresholds, totals, sorting, company selectors,
 last-action formatting, column persistence, checksum manifest parsing and
-file-integrity verification, and Google OAuth scope/config handling.
+file-integrity verification, Google OAuth scope/config handling, monthly
+income/profit rolling calculations, per-item stock history selection, info-
+glyph field explanations, and Company Health Score ranking - including the
+v2 cursor-pagination fetch, daily star-count refresh, fixed-count
+rank-slot allocation, generalized promotion/demotion thresholds, direct
+Weekly Income snapshots aligned to 18:10 UTC, coverage/percentile boundaries,
+the observed-range popup, scheduled-task XML/gating, the neighbor popup, and
+the Company Rankings tab.
 
 ## Building the Windows executable
 
@@ -274,11 +407,12 @@ against a source independent of the downloaded executable.
 
 ## Legal documents
 
-Draft Terms of Service and Privacy Policy documents are stored in `legal\`.
-They identify Khristian Boone, also known as sharpsplinter `[351311]`, and
-include Ohio, EEA, and UK provisions. Replace all bracketed contact and
-representative placeholders and obtain qualified legal review before
-publication.
+Draft Terms of Service and Privacy Policy documents are stored in `legal\`
+as `.docx` files, and are viewable in-app from the **Legal** menu (next to
+**File**) via **TOS** and **Privacy Policy**. They identify Khristian Boone,
+also known as sharpsplinter `[351311]`, and include Ohio, EEA, and UK
+provisions. Replace all bracketed contact and representative placeholders
+and obtain qualified legal review before publication.
 
 ## Project layout
 
@@ -292,6 +426,10 @@ app/torn_api.py         Torn API wrapper
 app/tornstats_api.py    Tornstats projection API wrapper
 app/efficiency_calc.py  Projection, best-fit, locking, and assignment logic
 app/profit_calc.py      Profit fields and seven-day rolling averages
+app/ranking_calc.py     Company Health Score ranking and generalized star-slot math
+app/income_tracking.py   18:10-aligned Weekly Income snapshots and star-range math
+app/scheduled_collection.py  Idempotent background collection and locking
+app/windows_scheduler.py Windows Scheduled Task installation and status
 app/sheets_client.py    Google Sheets access and automatic Sheet creation
 app/collector.py        Snapshot and Employee Efficiency orchestration
 app/checksum.py         SHA-256 hashing and .sha256 manifest parsing

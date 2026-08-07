@@ -114,9 +114,11 @@ def migrate():
 
         # avg_daily_profit_7day: always recompute, it cascades from daily_profit.
         old_avg = record.get("avg_daily_profit_7day")
+        # pyrefly: ignore [unsupported-operation]
         record["avg_daily_profit_7day"] = compute_avg_daily_profit_7day(
             prior_rows=processed,
             current_timestamp=timestamp,
+            # pyrefly: ignore [bad-argument-type]
             current_daily_profit=record["daily_profit"],
         )
         if is_blank(old_avg) or safe_float(old_avg) != record["avg_daily_profit_7day"]:
@@ -124,6 +126,7 @@ def migrate():
 
         # avg_daily_income_7day: always recompute, same rolling-window logic.
         old_avg_income = record.get("avg_daily_income_7day")
+        # pyrefly: ignore [unsupported-operation]
         record["avg_daily_income_7day"] = compute_avg_daily_income_7day(
             prior_rows=processed,
             current_timestamp=timestamp,
